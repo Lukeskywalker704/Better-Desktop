@@ -4197,17 +4197,23 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                             let ddy = my - press_pos.1;
                             if ddx * ddx + ddy * ddy > 25.0 {
                                 is_dragging = true;
-                                let (cx, cy) = (config.cards[idx].x, config.cards[idx].y);
-                                drag_off = (mx - cx, my - cy);
+                                // grab from where the card is *drawn*: a folded
+                                // pill is right-aligned, so its x sits far left
+                                // of what the pointer sees
+                                let c = &config.cards[idx];
+                                drag_off = (mx - c.visual_x(), my - c.y);
                             }
                         }
                         if is_dragging {
                             let w = config.cards[idx].width;
                             let h = config.cards[idx].box_h();
+                            let shift = w - config.cards[idx].box_w();
+                            let want_x = mx - drag_off.0 - shift;
+                            let want_y = my - drag_off.1;
                             let (nx, ny, g) = if alt_down {
-                                (mx - drag_off.0, my - drag_off.1, Vec::new())
+                                (want_x, want_y, Vec::new())
                             } else {
-                                snap_position(&config.cards, idx, &areas, mx - drag_off.0, my - drag_off.1, w, h, ui_scale())
+                                snap_position(&config.cards, idx, &areas, want_x, want_y, w, h, ui_scale())
                             };
                             config.cards[idx].x = nx;
                             config.cards[idx].y = ny;
