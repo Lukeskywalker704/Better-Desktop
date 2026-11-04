@@ -27,7 +27,7 @@ use winapi::{
             CloseClipboard, DestroyMenu, DrawTextW, EnumDisplayMonitors, FindWindowW, GetClassNameW,
             GetClipboardData, GetCursorPos, GetForegroundWindow, GetMonitorInfoW, keybd_event,
             MessageBoxW, OpenClipboard, RegisterHotKey,
-            GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, LoadImageW,
+            GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, LoadImageW, MonitorFromPoint,
             MONITORINFO, PostMessageW,
             PrintWindow, RegisterClassW,
             ReleaseDC, ReleaseCapture, SetCapture, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, TrackPopupMenu,
@@ -116,6 +116,9 @@ struct Card {
     /// folded down to the caption strip; `height` keeps the expanded size
     #[serde(default)]
     collapsed: bool,
+    /// DPI this card's pixel size was chosen for (0 = adopt on first layout)
+    #[serde(default)]
+    dpi: f32,
 }
 
 fn default_true() -> bool { true }
@@ -129,8 +132,15 @@ impl Card {
         let base = CARD_BASE_W * ui_scale();
         Self {
             x, y, width: base, height: base * CARD_ASPECT, path, color,
-            auto_fit: true, collapsed: false,
+            auto_fit: true, collapsed: false, dpi: 0.0,
         }
+    }
+    /// Same card, sized for a specific monitor scale instead of the system one.
+    fn with_scale(path: String, x: f32, y: f32, scale: f32) -> Self {
+        let mut card = Self::new(path, x, y);
+        card.width = CARD_BASE_W * scale;
+        card.height = card.width * CARD_ASPECT;
+        card
     }
     fn file_name(&self) -> String {
         FsPath::new(&self.path).file_name().unwrap_or_default().to_string_lossy().to_string()
@@ -2363,7 +2373,10 @@ fn add_paths(
             continue;
         }
         let (want_x, want_y) = at.unwrap_or(fallback);
-        let mut card = Card::new(p.clone(), want_x - 150.0, want_y - 218.0);
+        let area = area_for(areas, want_x, want_y, 120.0, 120.0);
+        let scale = area.map(|a| a.scale()).unwrap_or_else(ui_scale);
+        let mut card = Card::with_scale(p.clone(), want_x - 150.0, want_y - 218.0, scale);
+        card.dpi = area.map(|a| a.dpi).unwrap_or(96.0);
         let (px, py) = place_free(&config.cards, areas, card.x, card.y, card.box_w(), card.box_h(), gap);
         card.x = px;
         card.y = py;
@@ -2412,7 +2425,21 @@ fn resize_cursor(e: u8) -> CursorIcon {
 /// One monitor's usable desktop (its work area minus the taskbar), already
 /// inset by the screen margin so cards keep a little air from every edge.
 #[derive(Clone, Copy)]
-struct WorkArea { x: f32, y: f32, w: f32, h: f32 }
+struct WorkArea {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// effective DPI of that monitor (96 = 100 %)
+    dpi: f32,
+    primary: bool,
+}
+
+impl WorkArea {
+    fn scale(&self) -> f32 {
+        (self.dpi / 96.0).clamp(0.5, 4.0)
+    }
+}
 
 /// A line drawn while dragging to show what the card is lining up with.
 struct Guide { vertical: bool, pos: f32, from: f32, to: f32 }
@@ -2422,6 +2449,30 @@ const WORK_MARGIN: f32 = 16.0;
 const SNAP_EDGE: f32 = 24.0;
 /// pull towards another card's edge, × DPI scale
 const SNAP_PEER: f32 = 8.0;
+
+/// Effective DPI of the monitor under a point (falls back to the system DPI).
+fn monitor_dpi(_left: i32, _top: i32, x: i32, y: i32) -> Option<u32> {
+    unsafe {
+        let pt = POINT { x, y };
+        let hmon = MonitorFromPoint(pt, 2); // MONITOR_DEFAULTTONEAREST
+        if hmon.is_null() {
+            return None;
+        }
+        let mut dx = 0u32;
+        let mut dy = 0u32;
+        let ok = windows::Win32::UI::HiDpi::GetDpiForMonitor(
+            windows::Win32::Graphics::Gdi::HMONITOR(hmon as *mut core::ffi::c_void),
+            windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI,
+            &mut dx,
+            &mut dy,
+        );
+        if ok.is_ok() && dx > 0 {
+            Some(dx)
+        } else {
+            None
+        }
+    }
+}
 
 fn work_areas(margin: f32) -> Vec<WorkArea> {
     unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, data: LPARAM) -> BOOL {
@@ -2435,6 +2486,8 @@ fn work_areas(margin: f32) -> Vec<WorkArea> {
                 y: r.top as f32,
                 w: (r.right - r.left) as f32,
                 h: (r.bottom - r.top) as f32,
+                dpi: 96.0,
+                primary: info.dwFlags & 1 != 0, // MONITORINFOF_PRIMARY
             });
         }
         1
@@ -2448,14 +2501,39 @@ fn work_areas(margin: f32) -> Vec<WorkArea> {
             &mut raw as *mut _ as LPARAM,
         );
     }
+    // margin and card sizes follow each monitor's own scale, so a 100 % screen
+    // next to a 4K 150 % one still looks consistent
     raw.into_iter()
-        .map(|a| WorkArea {
-            x: a.x + margin,
-            y: a.y + margin,
-            w: (a.w - margin * 2.0).max(120.0),
-            h: (a.h - margin * 2.0).max(120.0),
+        .map(|a| {
+            let dpi = monitor_dpi(
+                a.x as i32,
+                a.y as i32,
+                ((a.w * 0.5) as i32) + a.x as i32,
+                ((a.h * 0.5) as i32) + a.y as i32,
+            )
+            .unwrap_or(96) as f32;
+            let m = margin * (dpi / 96.0);
+            WorkArea {
+                x: a.x + m,
+                y: a.y + m,
+                w: (a.w - m * 2.0).max(120.0),
+                h: (a.h - m * 2.0).max(120.0),
+                dpi,
+                primary: a.primary,
+            }
         })
         .collect()
+}
+
+/// Work areas translated into window coordinates (the overlay starts at the
+/// top-left of the virtual screen, cards are stored in that same space).
+fn screen_areas(margin: f32, vx: i32, vy: i32) -> Vec<WorkArea> {
+    let mut areas = work_areas(margin);
+    for a in &mut areas {
+        a.x -= vx as f32;
+        a.y -= vy as f32;
+    }
+    areas
 }
 
 /// The monitor a card belongs to: most overlap wins, nearest centre otherwise.
@@ -2729,6 +2807,31 @@ fn clamp_card(card: &mut Card, areas: &[WorkArea]) {
     let vx = card.visual_x().clamp(a.x, a.x + a.w - card.box_w());
     card.x = vx + shift;
     card.y = card.y.clamp(a.y, a.y + a.h - visible_h);
+}
+
+/// Keep a card's apparent size the same when it lands on a monitor with a
+/// different DPI: 150 % -> 100 % shrinks it by a third, and back again.
+fn rescale_card_for_monitor(card: &mut Card, areas: &[WorkArea]) {
+    let Some(area) = area_for(areas, card.x, card.y, card.box_w(), card.box_h()) else { return };
+    let want = area.dpi;
+    if card.dpi <= 0.0 {
+        card.dpi = want; // first time we see this card: adopt, do not resize
+        return;
+    }
+    let ratio = want / card.dpi;
+    if (ratio - 1.0).abs() < 0.02 {
+        card.dpi = want;
+        return;
+    }
+    let before = (card.x, card.y, card.width, card.height);
+    card.width = (card.width * ratio).clamp(200.0, 2600.0);
+    card.height = (card.height * ratio).clamp(160.0, 2600.0);
+    card.dpi = want;
+    clamp_card(card, areas);
+    if std::env::var("BD_DPI_DEBUG").is_ok() {
+        eprintln!("rescale {:?} -> {:?} (ratio {ratio:.3}, area dpi {want})",
+                  before, (card.x, card.y, card.width, card.height));
+    }
 }
 
 /// Snap a dragged card: screen edges first (they define the desktop), then the
@@ -3304,7 +3407,7 @@ fn dump_bmp(path: PathBuf, fb: &Framebuffer) {
 fn main() {
     // one overlay per desktop: two instances would fight over the config file
     if std::env::var("BD_PROBE").is_err() && std::env::var("BD_BENCH").is_err() && std::env::var("BD_SNAP").is_err()
-        && std::env::var("BD_BACKDROP").is_err()
+        && std::env::var("BD_BACKDROP").is_err() && std::env::var("BD_DPI").is_err()
     {
         unsafe {
             let name = wide("BetterDesktop.SingleInstance.v1");
@@ -3370,7 +3473,20 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
 
     // keep every card inside some monitor's work area (a monitor may be gone
     // since the last run, and cards must never hide under the taskbar)
-    let mut areas = work_areas(WORK_MARGIN * ui_scale());
+    let mut areas = screen_areas(WORK_MARGIN * ui_scale(), vx, vy);
+    if std::env::var("BD_DPI").is_ok() {
+        for (i, a) in areas.iter().enumerate() {
+            eprintln!(
+                "monitor {i}: work area {}x{} at ({}, {})  dpi={}  scale={:.2}  primary={}",
+                a.w as i32, a.h as i32, a.x as i32, a.y as i32, a.dpi as i32, a.scale(), a.primary
+            );
+        }
+        eprintln!("system dpi scale: {:.2}", ui_scale());
+        std::process::exit(0);
+    }
+    for c in &mut config.cards {
+        rescale_card_for_monitor(c, &areas);
+    }
     if config.rail {
         // a column always re-packs on load, so a layout saved while folded can
         // never come back with the cards overlapping
@@ -3526,9 +3642,15 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     // cards born recently, animating in (index, birth instant)
     let mut anims: Vec<(usize, std::time::Instant)> = Vec::new();
     let k = ui_scale();
-    let fab_y = vh as f32 - 118.0 * k;
-    let add_btn_center = (vw as f32 * 0.5 - 32.0 * k, fab_y);
-    let gear_btn_center = (vw as f32 * 0.5 + 32.0 * k, fab_y);
+    // the two pucks sit at the bottom of the *primary* monitor: centring them on
+    // the virtual screen would put them on the seam between two displays
+    let primary = areas.iter().find(|a| a.primary).copied().or_else(|| areas.first().copied());
+    let (fab_x, fab_bottom) = primary
+        .map(|a| ((a.x + a.w * 0.5) - vx as f32, (a.y + a.h) - vy as f32))
+        .unwrap_or((vw as f32 * 0.5, vh as f32));
+    let fab_y = fab_bottom - 96.0 * k;
+    let add_btn_center = (fab_x - 32.0 * k, fab_y);
+    let gear_btn_center = (fab_x + 32.0 * k, fab_y);
     let mut add_btn_hover = false;
     let mut gear_btn_hover = false;
     let mut press_on_add = false;
@@ -3659,6 +3781,10 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                         card.y = card.y.round();
                         card.width = card.width.round().max(200.0 * ui_scale());
                         card.height = card.height.round().max(160.0 * ui_scale());
+                        // resizing by hand pins this monitor's scale for the card
+                        if let Some(a) = area_for(&areas, card.x, card.y, card.width, card.height) {
+                            card.dpi = a.dpi;
+                        }
                         config.cards[idx] = card;
                         guides.clear();
                         config.rail = false;
@@ -3719,6 +3845,7 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                             // pixels so repeated drags cannot drift
                             let mut card = config.cards[idx].clone();
                             clamp_card(&mut card, &areas);
+                            rescale_card_for_monitor(&mut card, &areas);
                             card.x = card.x.round();
                             card.y = card.y.round();
                             config.cards[idx] = card;
@@ -3999,7 +4126,7 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                 if DISPLAY_CHANGED.swap(false, Ordering::Relaxed) {
                     // monitors came or went: rebuild the work areas and bring
                     // every card back inside one of them
-                    areas = work_areas(WORK_MARGIN * ui_scale());
+                    areas = screen_areas(WORK_MARGIN * ui_scale(), vx, vy);
                     for c in &mut config.cards {
                         clamp_card(c, &areas);
                     }
