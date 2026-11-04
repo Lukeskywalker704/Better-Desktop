@@ -1204,15 +1204,36 @@ fn resolve_media(target: &str) -> Option<String> {
 /// The biggest picture on the first slide, decoded. A designed deck is mostly a
 /// picture, so this is the closest thing to a real slide preview we can render.
 fn pptx_slide_image(path: &str) -> Option<Thumbnail> {
-    let rels = zip_entry(path, &["ppt/slides/_rels/slide1.xml.rels"])?;
+    // the cover slide is often text-only: walk the first slides, then fall back
+    // to the layout background the deck inherits
+    for n in 1..=3 {
+        if let Some(t) = pptx_picture_of(path, "slides", &format!("slide{n}")) { return Some(t); }
+    }
+    let rels_name = "ppt/slides/_rels/slide1.xml.rels".to_string();
+    let rels = zip_entry(path, &[rels_name.as_str()])?;
+    let rels = String::from_utf8_lossy(&rels).to_string();
+    for (_, target) in rel_targets(&rels) {
+        let Some(part) = resolve_media(&target) else { continue };
+        let Some(stem) = part.strip_prefix("ppt/slideLayouts/") else { continue };
+        let Some(stem) = stem.strip_suffix(".xml") else { continue };
+        if let Some(t) = pptx_picture_of(path, "slideLayouts", stem) { return Some(t); }
+    }
+    None
+}
+
+/// Biggest picture referenced by one slide part (`kind` = slides / slideLayouts).
+fn pptx_picture_of(path: &str, kind: &str, stem: &str) -> Option<Thumbnail> {
+    let rels_name = format!("ppt/{kind}/_rels/{stem}.xml.rels");
+    let part_name = format!("ppt/{kind}/{stem}.xml");
+    let rels = zip_entry(path, &[rels_name.as_str()])?;
     let rels = String::from_utf8_lossy(&rels).to_string();
     let pairs = rel_targets(&rels);
-    let slide = zip_entry(path, &["ppt/slides/slide1.xml"])?;
-    let slide = String::from_utf8_lossy(&slide).to_string();
+    let body = zip_entry(path, &[part_name.as_str()])?;
+    let body = String::from_utf8_lossy(&body).to_string();
 
     let mut best: Option<Thumbnail> = None;
     let mut best_area = 0usize;
-    for id in slide_embeds(&slide) {
+    for id in slide_embeds(&body) {
         let Some((_, target)) = pairs.iter().find(|(rid, _)| rid == &id) else { continue };
         let Some(part) = resolve_media(target) else { continue };
         let Some(bytes) = zip_entry(path, &[part.as_str()]) else { continue };

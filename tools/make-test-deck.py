@@ -1,36 +1,42 @@
-"""Build a small deck with a picture + text so the pptx preview can be checked."""
+"""Two decks: picture on slide 2, and text-only, to check the preview fallbacks."""
 import os
 
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Inches
 
-prs = Presentation()
-prs.slide_width = Inches(13.333)
-prs.slide_height = Inches(7.5)
+out_dir = "demo"
 
-# slide 1: title + one picture (this is what the card should preview)
-s1 = prs.slides.add_slide(prs.slide_layouts[5])
-s1.shapes.title.text = "2026 产品发布会"
-pic_path = "docs/preview.png"
-if os.path.exists(pic_path):
-    s1.shapes.add_picture(pic_path, Inches(0.6), Inches(1.9), width=Inches(12.1))
-sub = s1.shapes.add_textbox(Inches(0.6), Inches(1.2), Inches(9), Inches(0.7))
-sub.text_frame.text = "创新驱动未来 · 上海"
 
-# slide 2 and 3: text only
-for title, bullets in [
-    ("议程", ["过去一年的增长", "新品矩阵", "开放生态", "下一步计划"]),
-    ("关键数据", ["营收 12.4 亿，同比 +38%", "活跃用户 4200 万", "企业客户 8600 家"]),
-]:
-    s = prs.slides.add_slide(prs.slide_layouts[1])
-    s.shapes.title.text = title
-    body = s.placeholders[1].text_frame
-    body.text = bullets[0]
-    for b in bullets[1:]:
-        p = body.add_paragraph()
-        p.text = b
+def make(path, picture_slide):
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
 
-os.makedirs("demo", exist_ok=True)
-out = "demo/产品发布会-带图.pptx"
-prs.save(out)
-print("saved", out, os.path.getsize(out) // 1024, "KB")
+    # slide 1: text only
+    s1 = prs.slides.add_slide(prs.slide_layouts[1])
+    s1.shapes.title.text = "2026 年度复盘"
+    body = s1.placeholders[1].text_frame
+    body.text = "业务回顾与展望"
+    p = body.add_paragraph()
+    p.text = "内部资料 · 请勿外传"
+
+    # slide 2 (optional): the picture
+    s2 = prs.slides.add_slide(prs.slide_layouts[5])
+    s2.shapes.title.text = "关键图表"
+    if picture_slide and os.path.exists("docs/preview.png"):
+        s2.shapes.add_picture("docs/preview.png", Inches(1.0), Inches(1.8), width=Inches(11.3))
+
+    # slide 3: text
+    s3 = prs.slides.add_slide(prs.slide_layouts[1])
+    s3.shapes.title.text = "下一步"
+    b3 = s3.placeholders[1].text_frame
+    b3.text = "补齐数据看板"
+    q = b3.add_paragraph()
+    q.text = "Q1 完成灰度"
+
+    prs.save(path)
+    print("saved", path, os.path.getsize(path) // 1024, "KB")
+
+
+make(os.path.join(out_dir, "复盘-图在第2页.pptx"), True)
+make(os.path.join(out_dir, "复盘-纯文字.pptx"), False)
