@@ -1,5 +1,7 @@
 # better desktop
 
+<img src="docs/icon.png" width="112" align="right" alt="icon" />
+
 > Windows desktop cards: pin files to the wallpaper as readable paper sheets — drag, resize, fold, and tidy them into a right-hand rail.
 >
 > Windows 桌面卡片：把文件变成壁纸上的纸面卡片，真实文档预览，可拖动、缩放、折叠，一键整理成右侧列表，点一下打开。
@@ -33,6 +35,11 @@ cargo build --release     # 精简发布版：LTO + strip + panic=abort，约 0.
 | `Ctrl+Alt+H` | 全部折叠 ↔ 全部展开 |
 | `Ctrl+Alt+T` | 整理成右侧一列（放不下时自动变成可滚动列） |
 | 齿轮菜单 | 刷新缩略图 / 重采样壁纸 / 置顶显示 / 全部折叠·展开 / 整理成列 / 配置目录 / 退出 |
+
+## 图标
+
+exe 内嵌了 `icon.ico`（`app.rc` + `build.rs`，windres 编译），托盘图标也用它；同时写入版本信息（FileVersion / ProductName / MIT）。
+重新生成图标：`python tools/make-icon.py`（需要 Pillow），会同时输出 `icon.ico` 与 `docs/icon.png`。
 
 ## 命令行
 

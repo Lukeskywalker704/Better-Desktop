@@ -11,7 +11,7 @@ use std::{
 };
 use winapi::{
     shared::minwindef::{BOOL, LPARAM, LRESULT, WPARAM},
-    shared::windef::{HBITMAP, HDC, HGDIOBJ, HMONITOR, HWND, POINT, RECT, SIZE},
+    shared::windef::{HBITMAP, HDC, HGDIOBJ, HICON, HMONITOR, HWND, POINT, RECT, SIZE},
     um::{
         errhandlingapi::GetLastError,
         libloaderapi::GetModuleHandleW,
@@ -27,10 +27,12 @@ use winapi::{
             CloseClipboard, DestroyMenu, DrawTextW, EnumDisplayMonitors, FindWindowW, GetClassNameW,
             GetClipboardData, GetCursorPos, GetForegroundWindow, GetMonitorInfoW, keybd_event,
             MessageBoxW, OpenClipboard, RegisterHotKey,
-            GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, MONITORINFO, PostMessageW,
+            GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, LoadImageW,
+            MONITORINFO, PostMessageW,
             PrintWindow, RegisterClassW,
             ReleaseDC, ReleaseCapture, SetCapture, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, TrackPopupMenu,
-            UpdateLayeredWindow, GWL_EXSTYLE, GWLP_WNDPROC, HWND_MESSAGE, IDI_APPLICATION,
+            UpdateLayeredWindow, GWL_EXSTYLE, GWLP_WNDPROC, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON,
+            LR_DEFAULTSIZE, LR_SHARED, MAKEINTRESOURCEW,
             SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
             CF_HDROP, HWND_BOTTOM, HWND_TOPMOST, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, VK_CONTROL,
@@ -2928,7 +2930,22 @@ fn setup_tray(main_hwnd: HWND) {
         nid.uID = 1;
         nid.uFlags = 0x7; // NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.uCallbackMessage = TRAY_CALLBACK;
-        nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as _);
+        // use the icon embedded in the exe (resource id 1) instead of the
+        // generic application icon
+        let module = GetModuleHandleW(std::ptr::null());
+        let icon = LoadImageW(
+            module,
+            MAKEINTRESOURCEW(1),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE | LR_SHARED,
+        );
+        nid.hIcon = if icon.is_null() {
+            LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as _)
+        } else {
+            icon as HICON
+        };
         let tip = wide("Better Desktop");
         let n = tip.len().min(128);
         nid.szTip[..n].copy_from_slice(&tip[..n]);

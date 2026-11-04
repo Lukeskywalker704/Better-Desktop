@@ -1,6 +1,6 @@
 [package]
 name = "better-desktop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Windows desktop cards: put your files on the wallpaper as paper sheets, one click to open"
 license = "MIT"
@@ -13,6 +13,9 @@ categories = ["gui"]
 [lints.clippy]
 too_many_arguments = "allow"
 type_complexity = "allow"
+
+[build-dependencies]
+embed-resource = "3"
 
 [dependencies]
 winit = "0.29"
