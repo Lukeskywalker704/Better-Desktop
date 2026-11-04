@@ -1238,6 +1238,12 @@ fn pptx_picture_of(path: &str, kind: &str, stem: &str) -> Option<Thumbnail> {
         let Some(part) = resolve_media(target) else { continue };
         let Some(bytes) = zip_entry(path, &[part.as_str()]) else { continue };
         let Some(t) = image_to_thumbnail(&bytes, &part, 900) else { continue };
+        // only a slide-shaped picture is worth showing: a square logo or a tiny
+        // decoration would make a terrible card, and the text page reads better
+        let aspect = t.width as f32 / t.height.max(1) as f32;
+        if !(1.15..=2.6).contains(&aspect) || t.width < 400 {
+            continue;
+        }
         let area = (t.width * t.height) as usize;
         if area > best_area {
             best_area = area;
