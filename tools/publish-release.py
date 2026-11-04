@@ -39,7 +39,16 @@ def git(*args):
 
 base = call("GET", f"{API}/git/ref/heads/main")["object"]["sha"]
 base_tree = call("GET", f"{API}/git/commits/{base}")["tree"]["sha"]
-changed = [f for f in git("diff", "--name-only", base, "HEAD").splitlines() if f]
+# the remote commit was made server-side: match it to the local commit with the
+# same tree, so the diff covers exactly the local work that is still missing
+remote_tree = call("GET", f"{API}/git/commits/{base}")["tree"]["sha"]
+same = None
+for sha in git("rev-list", "HEAD").splitlines():
+    if git("rev-parse", f"{sha}^{{tree}}") == remote_tree:
+        same = sha
+        break
+print("remote tree", remote_tree[:7], "matches local commit", (same or "none")[:7])
+changed = [f for f in git("diff", "--name-only", same or "HEAD~1", "HEAD").splitlines() if f]
 print("base:", base, "changed:", len(changed))
 
 entries = []
