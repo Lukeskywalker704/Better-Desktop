@@ -1,0 +1,16 @@
+# build output
+target/
+*.exe
+
+# runtime state (cards live in %APPDATA%\BetterDesktop)
+.better-desktop/
+
+# dev probe output and logs
+*.bmp
+*.log
+
+# generated screenshots
+demo/*.png
+
+# design references (9.9 MB, not needed to build or run)
+vibe_images/

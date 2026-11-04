@@ -1,0 +1,8 @@
+* text=auto
+
+# sample documents under demo/ are binary fixtures
+*.pdf  binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.png  binary

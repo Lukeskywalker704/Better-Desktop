@@ -1,0 +1,56 @@
+[package]
+name = "better-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Windows desktop cards: put your files on the wallpaper as paper sheets, one click to open"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Lukeskywalker704/Better-Desktop"
+keywords = ["desktop", "win32", "layered-window", "cards", "windows"]
+categories = ["gui"]
+
+# raster helpers take x, y, w, h, radius, colour, alpha... on purpose
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[dependencies]
+winit = "0.29"
+winapi = { version = "0.3", features = [
+    "winuser", "windef", "wingdi", "libloaderapi", "errhandlingapi",
+    "shellapi", "synchapi",
+]}
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+open = "5"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Data_Pdf",
+    "Foundation",
+    "Storage",
+    "Storage_Streams",
+] }
+zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
+png = "0.18.1"
+flate2 = "1.1.10"
+jpeg-decoder = "0.3.2"
+
+# per-pixel software rendering: an unoptimised debug build misses frames
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# a lean, self-contained exe: no debug info, no panic machinery, one codegen unit
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
