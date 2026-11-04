@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -25,7 +26,7 @@ use winapi::{
             AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
             CloseClipboard, DestroyMenu, DrawTextW, EnumDisplayMonitors, FindWindowW, GetClassNameW,
             GetClipboardData, GetCursorPos, GetForegroundWindow, GetMonitorInfoW, keybd_event,
-            OpenClipboard, RegisterHotKey,
+            MessageBoxW, OpenClipboard, RegisterHotKey,
             GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, MONITORINFO, PostMessageW,
             PrintWindow, RegisterClassW,
             ReleaseDC, ReleaseCapture, SetCapture, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, TrackPopupMenu,
@@ -63,6 +64,18 @@ fn ui_scale() -> f32 {
     UI_SCALE_MILLI.load(Ordering::Relaxed) as f32 / 1000.0
 }
 
+
+/// A plain message box, used by `--version` / `--help` and the tray menu.
+fn info_box(text: &str) {
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide(text).as_ptr(),
+            wide("better desktop").as_ptr(),
+            0x0000_0040, // MB_ICONINFORMATION
+        );
+    }
+}
 
 fn config_dir() -> PathBuf {
     // %APPDATA%\BetterDesktop: keeps the card layout out of the build tree, so
@@ -2859,13 +2872,19 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             AppendMenuW(menu, 0x00000000, 1, wide("添加卡片...").as_ptr());
             AppendMenuW(menu, 0x00000000, 2, wide("刷新全部缩略图").as_ptr());
             AppendMenuW(menu, 0x00000800, 0, std::ptr::null());
-            AppendMenuW(menu, 0x00000000, 3, wide("退出 Better Desktop").as_ptr());
+            AppendMenuW(menu, 0x00000800, 0, std::ptr::null());
+            AppendMenuW(menu, 0x00000000, 3, wide("关于 Better Desktop").as_ptr());
+            AppendMenuW(menu, 0x00000000, 4, wide("退出 Better Desktop").as_ptr());
             let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | 0x0002, pt.x, pt.y, 0, hwnd, std::ptr::null());
             DestroyMenu(menu);
             match cmd {
                 1 => *PENDING_ADDS.lock().unwrap() = vec![String::new()],
                 2 => REFRESH_REQUESTED.store(true, Ordering::Relaxed),
-                3 => { PostMessageW(MAIN_HWND.load(Ordering::Relaxed) as HWND, WM_CLOSE, 0, 0); }
+                3 => info_box(&format!(
+                    "better desktop {}\n\nWindows 桌面卡片\nhttps://github.com/Lukeskywalker704/Better-Desktop",
+                    env!("CARGO_PKG_VERSION")
+                )),
+                4 => { PostMessageW(MAIN_HWND.load(Ordering::Relaxed) as HWND, WM_CLOSE, 0, 0); }
                 _ => {}
             }
             return 0;
@@ -3154,6 +3173,31 @@ fn main() {
     UI_SCALE_MILLI.store(((dpi as f32 / 96.0) * 1000.0) as u32, Ordering::Relaxed);
 
     migrate_legacy_config();
+    // version / help: a released exe is a GUI program, so answer in a dialog
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V" || a == "-v") {
+        info_box(&format!(
+            "better desktop {}\n\nhttps://github.com/Lukeskywalker704/Better-Desktop",
+            env!("CARGO_PKG_VERSION")
+        ));
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        info_box("better desktop — Windows 桌面卡片\n\n\
+单击纸面：打开文件\n\
+拖动卡片 / 页眉：移动（Alt 关闭吸附）\n\
+拖四边或四角：独立调整宽高\n\
+滚轮：缩放；右侧滑动槽内滚轮：滚动整列\n\
+双击页眉 / 右上箭头：折叠 ↔ 展开\n\
+右键卡片：打开 / 折叠 / 刷新 / 移除\n\
+拖文件到卡片或 + 上：生成卡片\n\n\
+Ctrl+Alt+D  添加卡片（剪贴板 / 资源管理器选中）\n\
+Ctrl+Alt+H  全部折叠 ↔ 全部展开\n\
+Ctrl+Alt+T  整理成右侧一列\n\n\
+配置：%APPDATA%\\BetterDesktop");
+        return;
+    }
+
     let mut config = AppConfig::load();
 
     // virtual screen = union of all monitors, in physical pixels

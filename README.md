@@ -34,6 +34,15 @@ cargo build --release     # 精简发布版：LTO + strip + panic=abort，约 0.
 | `Ctrl+Alt+T` | 整理成右侧一列（放不下时自动变成可滚动列） |
 | 齿轮菜单 | 刷新缩略图 / 重采样壁纸 / 置顶显示 / 全部折叠·展开 / 整理成列 / 配置目录 / 退出 |
 
+## 命令行
+
+```sh
+better-desktop --version   # 版本号 + 仓库地址（弹窗，GUI 程序无控制台）
+better-desktop --help      # 快捷键速查
+```
+
+托盘图标右键还有「关于 Better Desktop」。发布版是 GUI 子系统程序，双击不会弹出黑色控制台窗口。
+
 ## 配置
 
 `%APPDATA%\BetterDesktop\config.json`（旧版放在 exe 旁边的 `.better-desktop\` 会自动迁移）。
