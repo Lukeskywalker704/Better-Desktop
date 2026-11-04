@@ -1263,6 +1263,209 @@ fn pptx_picture_of(path: &str, kind: &str, stem: &str) -> Option<Thumbnail> {
     best
 }
 
+
+/// One paragraph of a slide, with the style of its first run.
+struct SlideLine {
+    text: String,
+    size_pt: f32,
+    bold: bool,
+    color: (u8, u8, u8),
+    align: u8, // 0 left, 1 centre, 2 right
+    bullet: bool,
+}
+
+struct SlideShape {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    lines: Vec<SlideLine>,
+    image: Option<Thumbnail>,
+}
+
+/// A first slide we can actually draw: EMU geometry, solid background, text
+/// boxes and pictures.
+struct Slide {
+    w: f32,
+    h: f32,
+    bg: Option<(u8, u8, u8)>,
+    shapes: Vec<SlideShape>,
+}
+
+fn emu_attr(chunk: &str, name: &str) -> f32 {
+    attr_value(chunk, name)
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.0)
+}
+
+fn hex_color(raw: &str) -> Option<(u8, u8, u8)> {
+    if raw.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(raw, 16).ok()?;
+    Some((((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8))
+}
+
+/// Pull `algn`, bullet flag and the first run's style out of a `<a:p>` chunk.
+fn slide_line(para: &str) -> Option<SlideLine> {
+    let text = xml_tag_texts(para, "a:t");
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let first_run = para.split("<a:r>").nth(1).unwrap_or(para);
+    let size_pt = attr_value(first_run, "sz")
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(|v| v / 100.0)
+        .unwrap_or(18.0);
+    let bold = attr_value(first_run, "b").map(|v| v == "1").unwrap_or(false);
+    let color = first_run
+        .find("<a:srgbClr ")
+        .and_then(|i| hex_color(&attr_value(&first_run[i..], "val").unwrap_or_default()))
+        .unwrap_or((40, 40, 44));
+    let align = match attr_value(para, "algn").unwrap_or_default().as_str() {
+        "ctr" => 1,
+        "r" => 2,
+        _ => 0,
+    };
+    let bullet = para.contains("<a:buChar") || para.contains("<a:buAutoNum");
+    Some(SlideLine { text, size_pt, bold, color, align, bullet })
+}
+
+/// Parse the first slide of a deck into something drawable.
+fn slide_model(path: &str, n: u32) -> Option<Slide> {
+    let size = zip_entry(path, &["ppt/presentation.xml"])?;
+    let size = String::from_utf8_lossy(&size).to_string();
+    let (sw, sh) = size
+        .find("<p:sldSz ")
+        .map(|i| {
+            let chunk = &size[i..];
+            (emu_attr(chunk, "cx"), emu_attr(chunk, "cy"))
+        })
+        .filter(|(w, h)| *w > 0.0 && *h > 0.0)
+        .unwrap_or((12192000.0, 6858000.0));
+
+    let rels_name = format!("ppt/slides/_rels/slide{n}.xml.rels");
+    let part_name = format!("ppt/slides/slide{n}.xml");
+    let rels = zip_entry(path, &[rels_name.as_str()])?;
+    let rels = String::from_utf8_lossy(&rels).to_string();
+    let pairs = rel_targets(&rels);
+    let body = zip_entry(path, &[part_name.as_str()])?;
+    let body = String::from_utf8_lossy(&body).to_string();
+
+    let bg = body
+        .find("<p:bg>")
+        .and_then(|i| body[i..].find("<a:srgbClr "))
+        .map(|i| i + body.find("<p:bg>").unwrap())
+        .and_then(|i| hex_color(&attr_value(&body[i..], "val").unwrap_or_default()));
+
+    let mut shapes = Vec::new();
+    let mut rest = body.as_str();
+    // shapes and pictures interleave, so always take whichever comes first
+    while let Some(pos) = match (rest.find("<p:sp>"), rest.find("<p:pic>")) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    } {
+        let chunk_all = &rest[pos..];
+        let is_pic = chunk_all.starts_with("<p:pic>");
+        let close = if is_pic { "</p:pic>" } else { "</p:sp>" };
+        let end = chunk_all.find(close).map(|e| e + close.len()).unwrap_or(chunk_all.len());
+        let chunk = &chunk_all[..end.min(2400)];
+        rest = &chunk_all[end.min(chunk_all.len())..];
+
+        let xfrm = chunk.find("<a:xfrm").unwrap_or(0);
+        let geom = &chunk[xfrm..];
+        let x = emu_attr(geom, "x");
+        let y = emu_attr(geom, "y");
+        let w = emu_attr(geom, "cx");
+        let h = emu_attr(geom, "cy");
+        if w <= 0.0 || h <= 0.0 {
+            continue;
+        }
+
+        let mut lines = Vec::new();
+        for para in chunk.split("</a:p>") {
+            if let Some(line) = slide_line(para) {
+                lines.push(line);
+            }
+        }
+
+        let mut image = None;
+        if is_pic {
+            for id in slide_embeds(chunk) {
+                let Some((_, target)) = pairs.iter().find(|(rid, _)| rid == &id) else { continue };
+                let Some(part) = resolve_media(target) else { continue };
+                let Some(bytes) = zip_entry(path, &[part.as_str()]) else { continue };
+                image = image_to_thumbnail(&bytes, &part, 700);
+                if image.is_some() {
+                    break;
+                }
+            }
+        }
+        if lines.is_empty() && image.is_none() {
+            continue;
+        }
+        shapes.push(SlideShape { x, y, w, h, lines, image });
+    }
+
+    if shapes.is_empty() {
+        return None;
+    }
+    if std::env::var("BD_SLIDE_DEBUG").is_ok() {
+        eprintln!("slide {n}: {}x{} emu, bg={:?}, shapes={}", sw, sh, bg, shapes.len());
+        for s in &shapes {
+            eprintln!("  shape {:.0},{:.0} {:.0}x{:.0} lines={} image={}",
+                      s.x, s.y, s.w, s.h, s.lines.len(), s.image.is_some());
+        }
+    }
+    Some(Slide { w: sw, h: sh, bg, shapes })
+}
+
+/// Paint a parsed slide into the paper rect, scaled to fit.
+fn draw_slide(fb: &mut Framebuffer, slide: &Slide, px: f32, py: f32, pw: f32, ph: f32, radius: f32) {
+    // fit the slide into the paper, centred, and keep the paper's rounded corner
+    let scale = (pw / slide.w).min(ph / slide.h);
+    let body_w = slide.w * scale;
+    let body_h = slide.h * scale;
+    let sx0 = px + (pw - body_w) * 0.5;
+    let sy0 = py + (ph - body_h) * 0.5;
+    if let Some(bg) = slide.bg {
+        fb.round_rect(sx0, sy0, body_w, body_h, radius.max(6.0), bg, 255);
+    }
+    for shape in &slide.shapes {
+        let sx = (sx0 + shape.x * scale).max(sx0);
+        let sy = (sy0 + shape.y * scale).max(sy0);
+        let sw = (shape.w * scale).max(1.0).min(sx0 + body_w - sx);
+        let sh = (shape.h * scale).max(1.0).min(sy0 + body_h - sy);
+        if sw < 2.0 || sh < 2.0 {
+            continue;
+        }
+        if let Some(img) = &shape.image {
+            draw_thumbnail(fb, img, sx as i32, sy as i32, sw as i32, sh as i32);
+        }
+        if shape.lines.is_empty() {
+            continue;
+        }
+        let mut y = sy;
+        for line in &shape.lines {
+            let size = (line.size_pt * 12700.0 * scale).max(6.0);
+            if size < 7.0 || y > sy + sh + size * 2.0 {
+                break;
+            }
+            let text = if line.bullet { format!("· {}", line.text) } else { line.text.clone() };
+            for wrapped in wrap_lines(&text, size, sw * 0.98) {
+                draw_text(
+                    fb, &wrapped, sx as i32, y as i32, sw as i32,
+                    size as i32, if line.bold { 700 } else { 400 }, line.color, line.align,
+                );
+                y += size * 1.32;
+            }
+        }
+    }
+}
+
 fn pptx_blocks(path: &str) -> Vec<Block> {
     // the first slides carry the message; slide one supplies the caption
     let mut out = Vec::new();
@@ -1961,11 +2164,21 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, _hovered: bool,
         fb.round_rect(px + 2.0 * s, py + 3.0 * s, pw - 4.0 * s, ph + s, 12.0 * s, (40, 52, 74), fade(26.0));
         fb.glass_paper(px, py, pw, ph, 12.0 * s, band, anim);
         let blocks = doc_blocks(&card.path);
-        // a slide is mostly picture: show the deck's own first-slide image
-        // instead of the extracted text, which reads like a plain list
         let ext = card.file_ext();
-        let slide = matches!(ext.as_str(), "PPTX" | "PPTM" | "POTX" | "PPT");
-        if slide && thumb.is_some() {
+        let is_slide = matches!(ext.as_str(), "PPTX" | "PPTM" | "POTX" | "PPT");
+        // a real slide (background + positioned text boxes + pictures) beats any
+        // text approximation, so try that first
+        let mut drew_slide = false;
+        if is_slide {
+            if let Some(model) = slide_model(&card.path, 1) {
+                draw_slide(fb, &model, px + band, py + band, pw - 2.0 * band, ph - 2.0 * band, 10.0 * s);
+                drew_slide = true;
+            }
+        }
+        let slide = is_slide && !drew_slide;
+        if drew_slide {
+            // the slide already painted the paper
+        } else if slide && thumb.is_some() {
             let t = thumb.unwrap();
             draw_thumbnail(fb, t, (px + band) as i32, (py + band) as i32,
                            (pw - 2.0 * band) as i32, (ph - 2.0 * band) as i32);
