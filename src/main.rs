@@ -3225,8 +3225,8 @@ static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 /// Set by the global add-card hotkey (WM_HOTKEY).
 static HOTKEY_ADD: AtomicBool = AtomicBool::new(false);
-/// Set by the collapse-all / expand-all hotkey.
-static HOTKEY_FOLD_ALL: AtomicBool = AtomicBool::new(false);
+/// Fold request: 1 = fold everything, -1 = unfold everything, 2 = toggle.
+static FOLD_REQUEST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// Set by the tidy-into-a-column hotkey.
 static HOTKEY_TIDY: AtomicBool = AtomicBool::new(false);
 
@@ -3242,7 +3242,7 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         // WM_HOTKEY: id 1 adds cards, id 2 folds/unfolds everything
         match wp {
             1 => HOTKEY_ADD.store(true, Ordering::Relaxed),
-            2 => HOTKEY_FOLD_ALL.store(true, Ordering::Relaxed),
+            2 => FOLD_REQUEST.store(2, Ordering::Relaxed),
             3 => HOTKEY_TIDY.store(true, Ordering::Relaxed),
             _ => {}
         }
@@ -3332,23 +3332,80 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             AppendMenuW(menu, 0x00000000, 2, wide("刷新全部缩略图").as_ptr());
             AppendMenuW(menu, 0x00000800, 0, std::ptr::null());
             AppendMenuW(menu, 0x00000800, 0, std::ptr::null());
-            AppendMenuW(menu, 0x00000000, 3, wide("关于 Better Desktop").as_ptr());
-            AppendMenuW(menu, 0x00000000, 4, wide("退出 Better Desktop").as_ptr());
+            AppendMenuW(menu, 0x00000000, 3, wide("全部折叠").as_ptr());
+            AppendMenuW(menu, 0x00000000, 4, wide("全部展开").as_ptr());
+            AppendMenuW(menu, 0x00000800, 0, std::ptr::null());
+            AppendMenuW(menu, 0x00000000, 5, wide("关于 Better Desktop").as_ptr());
+            AppendMenuW(menu, 0x00000000, 6, wide("退出 Better Desktop").as_ptr());
             let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | 0x0002, pt.x, pt.y, 0, hwnd, std::ptr::null());
             DestroyMenu(menu);
             match cmd {
                 1 => *PENDING_ADDS.lock().unwrap() = vec![String::new()],
                 2 => REFRESH_REQUESTED.store(true, Ordering::Relaxed),
-                3 => info_box(&format!(
+                3 => FOLD_REQUEST.store(1, Ordering::Relaxed),
+                4 => FOLD_REQUEST.store(-1, Ordering::Relaxed),
+                5 => info_box(&format!(
                     "better desktop {}\n\nWindows 桌面卡片\nhttps://github.com/Lukeskywalker704/Better-Desktop",
                     env!("CARGO_PKG_VERSION")
                 )),
-                4 => { PostMessageW(MAIN_HWND.load(Ordering::Relaxed) as HWND, WM_CLOSE, 0, 0); }
+                6 => { PostMessageW(MAIN_HWND.load(Ordering::Relaxed) as HWND, WM_CLOSE, 0, 0); }
                 _ => {}
             }
             return 0;
         }
         DefWindowProcW(hwnd, msg, wp, lp)
+    }
+}
+
+/// Which modifier set actually got registered for each hotkey id, so the UI
+/// can tell the user when their favourite combo was taken by another app.
+static HOTKEY_LABELS: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn hotkey_label(mods: u32, vk: u32) -> String {
+    let mut s = String::new();
+    if mods & 0x2 != 0 { s.push_str("Ctrl+"); }
+    if mods & 0x1 != 0 { s.push_str("Alt+"); }
+    if mods & 0x4 != 0 { s.push_str("Shift+"); }
+    s.push((vk as u8) as char);
+    s
+}
+
+/// Register `id` with the first combo that is still free.
+fn register_hotkey(hwnd: HWND, id: i32, vk: u32, combos: &[u32]) -> Option<String> {
+    for extra in combos {
+        let mods = (MOD_CONTROL | MOD_ALT | (*extra as isize) | MOD_NOREPEAT) as u32;
+        let ok = unsafe { RegisterHotKey(hwnd, id, mods, vk) };
+        if ok != 0 {
+            let label = hotkey_label(mods, vk);
+            if let Ok(mut list) = HOTKEY_LABELS.lock() {
+                list.push((id as u32, label.clone()));
+            }
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// One-off balloon on the tray icon (used when a hotkey cannot be registered).
+fn tray_balloon(title: &str, text: &str) {
+    unsafe {
+        let hwnd = TRAY_HWND.load(Ordering::Relaxed) as HWND;
+        if hwnd.is_null() {
+            return;
+        }
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        nid.uFlags = 0x10; // NIF_INFO
+        nid.dwInfoFlags = 0x1; // NIIF_INFO
+        let t = wide(title);
+        let b = wide(text);
+        let tn = t.len().min(nid.szInfoTitle.len() - 1);
+        nid.szInfoTitle[..tn].copy_from_slice(&t[..tn]);
+        let bn = b.len().min(nid.szInfo.len() - 1);
+        nid.szInfo[..bn].copy_from_slice(&b[..bn]);
+        Shell_NotifyIconW(0x0000_0001, &mut nid); // NIM_MODIFY
     }
 }
 
@@ -3729,12 +3786,21 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     apply_zorder(get_hwnd(&window), config.topmost);
     // Ctrl+Alt+D: Explorer selection / clipboard files -> cards
     // Ctrl+Alt+H: fold everything / unfold everything
-    unsafe {
-        let _ = RegisterHotKey(get_hwnd(&window), 1, (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT) as u32, 0x44);
-        let _ = RegisterHotKey(get_hwnd(&window), 2, (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT) as u32, 0x48);
-        let _ = RegisterHotKey(get_hwnd(&window), 3, (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT) as u32, 0x54);
-    }
     setup_tray(get_hwnd(&window));
+    let hwnd = get_hwnd(&window);
+    let add = register_hotkey(hwnd, 1, 0x44, &[0]);
+    let fold = register_hotkey(hwnd, 2, 0x48, &[0, 0x4]); // Ctrl+Alt+H, then +Shift
+    let tidy = register_hotkey(hwnd, 3, 0x54, &[0]);
+    if fold.is_none() {
+        tray_balloon(
+            "better desktop",
+            "Ctrl+Alt+H 被别的程序占用了，全部折叠请用托盘或齿轮菜单",
+        );
+    } else if fold.as_deref() != Some("Ctrl+Alt+H") {
+        let label = fold.clone().unwrap_or_default();
+        tray_balloon("better desktop", &format!("全部折叠改用了 {label}（Ctrl+Alt+H 被占用）"));
+    }
+    let _ = (add, tidy);
 
     unsafe {
         SetWindowPos(get_hwnd(&window), std::ptr::null_mut(), vx, vy, vw, vh,
@@ -4352,12 +4418,17 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                     needs_save = true;
                     window.request_redraw();
                 }
-                if HOTKEY_FOLD_ALL.swap(false, Ordering::Relaxed) {
-                    // Ctrl+Alt+H: fold everything when anything is open, else unfold
-                    let any_open = config.cards.iter().any(|c| !c.collapsed);
+                let fold_req = FOLD_REQUEST.swap(0, Ordering::Relaxed);
+                if fold_req != 0 {
+                    // Ctrl+Alt+H toggles; the tray menu asks for one direction
+                    let collapse = if fold_req == 2 {
+                        config.cards.iter().any(|c| !c.collapsed)
+                    } else {
+                        fold_req > 0
+                    };
                     for c in &mut config.cards {
-                        c.collapsed = any_open;
-                        if !any_open {
+                        c.collapsed = collapse;
+                        if !collapse {
                             clamp_card(c, &areas);
                         }
                     }
