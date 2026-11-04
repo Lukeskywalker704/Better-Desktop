@@ -866,6 +866,11 @@ fn file_preview(path: &str, target: u32) -> Option<Thumbnail> {
             return pdf_first_page(path, target);
         }
     }
+    if ext == "PPTX" || ext == "PPTM" || ext == "POTX" {
+        // no thumbnail handler installed (no Office): use the deck's own first
+        // slide picture instead of a text-only page
+        return pptx_slide_image(path);
+    }
     None
 }
 
@@ -1124,17 +1129,141 @@ fn docx_blocks(xml: &str) -> Vec<Block> {
     out
 }
 
-fn pptx_blocks(xml: &str) -> Vec<Block> {
-    let mut out = Vec::new();
-    for para in xml.split("</a:p>") {
-        let text = xml_tag_texts(para, "a:t").trim().to_string();
-        if text.is_empty() { continue; }
-        if out.is_empty() {
-            out.push(Block::Title(text));
-        } else {
-            out.push(Block::Bullet(text));
+/// Turn an encoded image (png/jpeg/bmp) into a BGRA thumbnail capped at `target`.
+fn image_to_thumbnail(bytes: &[u8], hint: &str, target: u32) -> Option<Thumbnail> {
+    let (iw, ih, rgb) = decode_image(bytes, hint)?;
+    if iw == 0 || ih == 0 { return None; }
+    let scale = (target as f32 / iw as f32).min(target as f32 / ih as f32).min(1.0);
+    let tw = ((iw as f32 * scale).round() as usize).max(1);
+    let th = ((ih as f32 * scale).round() as usize).max(1);
+    let mut data = vec![0u8; tw * th * 4];
+    for y in 0..th {
+        let sy = (y * ih / th).min(ih - 1);
+        for x in 0..tw {
+            let sx = (x * iw / tw).min(iw - 1);
+            let s = (sy * iw + sx) * 3;
+            let d = (y * tw + x) * 4;
+            data[d] = rgb[s + 2];
+            data[d + 1] = rgb[s + 1];
+            data[d + 2] = rgb[s];
+            data[d + 3] = 255;
         }
-        if out.len() >= 24 { break; }
+    }
+    Some(Thumbnail { width: tw as u32, height: th as u32, data })
+}
+
+fn attr_value(chunk: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let i = chunk.find(&needle)?;
+    let after = &chunk[i + needle.len()..];
+    let j = after.find('"')?;
+    Some(after[..j].to_string())
+}
+
+/// Every `r:embed="rIdN"` in a slide, in document order.
+fn slide_embeds(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("r:embed=\"") {
+        let after = &rest[i + 9..];
+        match after.find('"') {
+            Some(j) => {
+                out.push(after[..j].to_string());
+                rest = &after[j..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// `Id -> Target` pairs from a `.rels` part.
+fn rel_targets(xml: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for chunk in xml.split("<Relationship ").skip(1) {
+        if let (Some(id), Some(target)) = (attr_value(chunk, "Id"), attr_value(chunk, "Target")) {
+            out.push((id, target));
+        }
+    }
+    out
+}
+
+/// Resolve a relationship target that is relative to `ppt/slides/`.
+fn resolve_media(target: &str) -> Option<String> {
+    let t = target.replace('\\', "/");
+    let path = if let Some(rest) = t.strip_prefix("../") {
+        format!("ppt/{rest}")
+    } else if let Some(rest) = t.strip_prefix('/') {
+        rest.to_string()
+    } else {
+        format!("ppt/slides/{t}")
+    };
+    if path.contains("..") { None } else { Some(path) }
+}
+
+/// The biggest picture on the first slide, decoded. A designed deck is mostly a
+/// picture, so this is the closest thing to a real slide preview we can render.
+fn pptx_slide_image(path: &str) -> Option<Thumbnail> {
+    // the cover slide is often text-only: walk the first slides, then fall back
+    // to the layout background the deck inherits
+    for n in 1..=3 {
+        if let Some(t) = pptx_picture_of(path, "slides", &format!("slide{n}")) { return Some(t); }
+    }
+    let rels_name = "ppt/slides/_rels/slide1.xml.rels".to_string();
+    let rels = zip_entry(path, &[rels_name.as_str()])?;
+    let rels = String::from_utf8_lossy(&rels).to_string();
+    for (_, target) in rel_targets(&rels) {
+        let Some(part) = resolve_media(&target) else { continue };
+        let Some(stem) = part.strip_prefix("ppt/slideLayouts/") else { continue };
+        let Some(stem) = stem.strip_suffix(".xml") else { continue };
+        if let Some(t) = pptx_picture_of(path, "slideLayouts", stem) { return Some(t); }
+    }
+    None
+}
+
+/// Biggest picture referenced by one slide part (`kind` = slides / slideLayouts).
+fn pptx_picture_of(path: &str, kind: &str, stem: &str) -> Option<Thumbnail> {
+    let rels_name = format!("ppt/{kind}/_rels/{stem}.xml.rels");
+    let part_name = format!("ppt/{kind}/{stem}.xml");
+    let rels = zip_entry(path, &[rels_name.as_str()])?;
+    let rels = String::from_utf8_lossy(&rels).to_string();
+    let pairs = rel_targets(&rels);
+    let body = zip_entry(path, &[part_name.as_str()])?;
+    let body = String::from_utf8_lossy(&body).to_string();
+
+    let mut best: Option<Thumbnail> = None;
+    let mut best_area = 0usize;
+    for id in slide_embeds(&body) {
+        let Some((_, target)) = pairs.iter().find(|(rid, _)| rid == &id) else { continue };
+        let Some(part) = resolve_media(target) else { continue };
+        let Some(bytes) = zip_entry(path, &[part.as_str()]) else { continue };
+        let Some(t) = image_to_thumbnail(&bytes, &part, 900) else { continue };
+        let area = (t.width * t.height) as usize;
+        if area > best_area {
+            best_area = area;
+            best = Some(t);
+        }
+    }
+    best
+}
+
+fn pptx_blocks(path: &str) -> Vec<Block> {
+    // the first slides carry the message; slide one supplies the caption
+    let mut out = Vec::new();
+    for n in 1..=3 {
+        let name = format!("ppt/slides/slide{n}.xml");
+        let Some(bytes) = zip_entry(path, &[name.as_str()]) else { continue };
+        let xml = String::from_utf8_lossy(&bytes).to_string();
+        for para in xml.split("</a:p>") {
+            let text = xml_tag_texts(para, "a:t").trim().to_string();
+            if text.is_empty() { continue; }
+            if out.is_empty() {
+                out.push(Block::Title(text));
+            } else {
+                out.push(Block::Bullet(text));
+            }
+            if out.len() >= 26 { return out; }
+        }
     }
     out
 }
@@ -1368,9 +1497,7 @@ fn extract_blocks(path: &str) -> Vec<Block> {
         "DOCX" | "DOCM" | "DOTX" => zip_entry(path, &["word/document.xml"])
             .map(|b| docx_blocks(&String::from_utf8_lossy(&b)))
             .unwrap_or_default(),
-        "PPTX" | "PPTM" | "POTX" => zip_entry(path, &["ppt/slides/slide1.xml", "ppt/slides/slide2.xml"])
-            .map(|b| pptx_blocks(&String::from_utf8_lossy(&b)))
-            .unwrap_or_default(),
+        "PPTX" | "PPTM" | "POTX" => pptx_blocks(path),
         "XLSX" | "XLSM" | "XLTX" => xlsx_blocks(path).unwrap_or_default(),
         "PDF" => pdf_blocks(path),
         "MD" | "MARKDOWN" => text_head(path, 400)
@@ -1818,7 +1945,15 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, _hovered: bool,
         fb.round_rect(px + 2.0 * s, py + 3.0 * s, pw - 4.0 * s, ph + s, 12.0 * s, (40, 52, 74), fade(26.0));
         fb.glass_paper(px, py, pw, ph, 12.0 * s, band, anim);
         let blocks = doc_blocks(&card.path);
-        if !blocks.is_empty() {
+        // a slide is mostly picture: show the deck's own first-slide image
+        // instead of the extracted text, which reads like a plain list
+        let ext = card.file_ext();
+        let slide = matches!(ext.as_str(), "PPTX" | "PPTM" | "POTX" | "PPT");
+        if slide && thumb.is_some() {
+            let t = thumb.unwrap();
+            draw_thumbnail(fb, t, (px + band) as i32, (py + band) as i32,
+                           (pw - 2.0 * band) as i32, (ph - 2.0 * band) as i32);
+        } else if !blocks.is_empty() {
             draw_doc_page(fb, &blocks, &style, px, py, pw, ph, s);
         } else if let Some(t) = thumb {
             // keep the glass edge clear of the image: the print sits inside it

@@ -50,6 +50,16 @@ better-desktop --help      # 快捷键速查
 
 托盘图标右键还有「关于 Better Desktop」。发布版是 GUI 子系统程序，双击不会弹出黑色控制台窗口。
 
+## 预览是怎么来的
+
+| 类型 | 预览 |
+|---|---|
+| 图片 | 直接用原图，卡片自动按图片比例变横/竖 |
+| PDF | 有文字层时按正文排版渲染；没有文字层时用 `Windows.Data.Pdf` 栅格化首页 |
+| DOCX / XLSX / MD / TXT | 解析 OOXML / 文本，按标题、正文、表格排版成可读的纸张 |
+| PPTX | 优先用第一页里最大的那张图（设计稿式的幻灯片最接近真实观感）；没有图则退回前 3 页的文字 |
+| 其他 | 系统缩略图（`IShellItemImageFactory`），空白缩略图会被丢弃 |
+
 ## 配置
 
 `%APPDATA%\BetterDesktop\config.json`（旧版放在 exe 旁边的 `.better-desktop\` 会自动迁移）。
