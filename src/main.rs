@@ -2002,7 +2002,7 @@ struct CardImage { w: i32, h: i32, px: Vec<u8>, body: (i32, i32, i32, i32) }
 
 type CardCache = HashMap<String, CardImage>;
 
-fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hover_idx: Option<usize>, lifted_idx: Option<usize>, thumbs: &HashMap<String, Thumbnail>, anims: &[(usize, std::time::Instant)], toolbar: Toolbar, drag_active: bool, guides: &[Guide], edge_hint: Option<(usize, u8)>) {
+fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hover_idx: Option<usize>, lifted_idx: Option<usize>, thumbs: &HashMap<String, Thumbnail>, anims: &[(usize, std::time::Instant)], folds: &HashMap<String, FoldAnim>, toolbar: Toolbar, drag_active: bool, guides: &[Guide], edge_hint: Option<(usize, u8)>) {
     fb.clear();
     if drag_active {
         // alpha>=1 makes the whole window hit-testable, turning the entire
@@ -2016,12 +2016,14 @@ fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hov
     for (i, card) in cards.iter().enumerate() {
         if lifted_idx == Some(i) { continue; }
         let anim = anim_progress(anims, i, now);
-        draw_card(fb, cache, card, hover_idx == Some(i), false, anim, thumbs.get(&card.path), backdrop);
+        let open = open_of(folds, &card.path, card.collapsed, now);
+        draw_card(fb, cache, card, hover_idx == Some(i), false, anim, thumbs.get(&card.path), backdrop, open);
     }
     // lifted card renders last so it floats above the others
     if let Some(i) = lifted_idx {
         if let Some(card) = cards.get(i) {
-            draw_card(fb, cache, card, hover_idx == Some(i), true, anim_progress(anims, i, now), thumbs.get(&card.path), backdrop);
+            let open = open_of(folds, &card.path, card.collapsed, now);
+            draw_card(fb, cache, card, hover_idx == Some(i), true, anim_progress(anims, i, now), thumbs.get(&card.path), backdrop, open);
         }
     }
     drop(guard);
@@ -2099,26 +2101,29 @@ fn thumb_sig(t: Option<&Thumbnail>) -> u64 {
     }
 }
 
-fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: bool, lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>) {
+fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: bool, lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>, open: f32) {
     if anim <= 0.02 { return; }
     let w = card.box_w();
-    let h = card.box_h();
     let s = (w / CARD_BASE_W).clamp(0.45, 2.4);
+    let h_folded = COLLAPSED_H * card.scale();
+    let h_full = card.height.max(h_folded);
+    let h = (h_folded + (h_full - h_folded) * open.clamp(0.0, 1.0)).round();
     let lift = if lifted { 8.0 * s } else { 0.0 };
-    let slide = (1.0 - anim) * 18.0 * s;
+    // an 8px rise with the spring instead of the old 18px slide
+    let slide = (1.0 - anim).clamp(0.0, 1.0) * 8.0 * s;
     let dx = card.visual_x();
     let dy = card.y - lift - slide;
 
-    if anim < 0.999 {
-        // transient entrance animation: paint straight onto the frame
-        paint_card(fb, card, dx, dy, hovered, lifted, anim, thumb, backdrop);
+    if anim < 0.999 || open < 0.999 {
+        // transient animation: paint straight onto the frame, no cache
+        paint_card(fb, card, dx, dy, hovered, lifted, anim, thumb, backdrop, open);
         return;
     }
 
     let pad = (30.0 * s).ceil() as i32;
     let key = format!(
-        "{}|{}x{}|{}{}{}|{}", card.path, w as i32, h as i32,
-        hovered as u8, lifted as u8, card.collapsed as u8, thumb_sig(thumb)
+        "{}|{}x{}|{}{}|{}", card.path, w as i32, h as i32,
+        hovered as u8, lifted as u8, thumb_sig(thumb)
     );
     if let Some(img) = cache.get(&key) {
         blit_card(fb, img, dx as i32 - pad, dy as i32 - pad, backdrop);
@@ -2127,7 +2132,7 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
     let bw = w as i32 + pad * 2;
     let bh = h as i32 + pad * 2;
     let mut scratch = Framebuffer::new(bw.max(1) as u32, bh.max(1) as u32);
-    paint_card(&mut scratch, card, pad as f32, pad as f32, hovered, lifted, 1.0, thumb, backdrop);
+    paint_card(&mut scratch, card, pad as f32, pad as f32, hovered, lifted, 1.0, thumb, backdrop, open);
     let img = CardImage {
         w: bw, h: bh, px: std::mem::take(&mut scratch.pixels),
         // the paper no longer has a translucent band, so nothing needs to be
@@ -2139,15 +2144,68 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
     cache.insert(key, img);
 }
 
-/// Ease-out entrance progress for card `i` (1.0 = fully shown).
+/// Damped spring, solved analytically: 0 at `t = 0`, 1 at `t = inf`. With
+/// response 0.42 s and damping 0.82 it settles in ~0.5 s with a slight
+/// overshoot, which is the motion macOS uses for sheets and widgets.
+fn spring(t: f32, response: f32, damping: f32) -> f32 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    let omega = std::f32::consts::TAU / response;
+    let zeta = damping.clamp(0.05, 1.5);
+    let wd = omega * (1.0 - zeta * zeta).max(0.0001).sqrt();
+    let e = (-zeta * omega * t).exp();
+    1.0 - e * ((wd * t).cos() + (zeta * omega / wd) * (wd * t).sin())
+}
+
+/// Spring-driven entrance progress for card `i` (1.0 = fully shown).
 fn anim_progress(anims: &[(usize, std::time::Instant)], i: usize, now: std::time::Instant) -> f32 {
     match anims.iter().find(|(ai, _)| *ai == i) {
         Some((_, t)) => {
-            let e = now.duration_since(*t).as_secs_f32() / 0.35;
-            if e >= 1.0 { 1.0 } else { 1.0 - (1.0 - e).powi(3) }
+            let e = now.duration_since(*t).as_secs_f32();
+            if e >= 0.55 { 1.0 } else { spring(e, 0.42, 0.82).clamp(0.0, 1.06) }
         }
         None => 1.0,
     }
+}
+
+/// Visual "openness" of a card: 1 = full sheet, 0 = folded pill. While folding
+/// the value springs between the two, so the sheet grows and fades instead of
+/// snapping.
+#[derive(Clone, Copy)]
+struct FoldAnim { from: f32, to: f32, at: std::time::Instant }
+
+fn open_of(anims: &HashMap<String, FoldAnim>, path: &str, collapsed: bool, now: std::time::Instant) -> f32 {
+    // render checks can freeze a card mid-fold
+    if let Ok(v) = std::env::var("BD_OPEN") {
+        if let Ok(f) = v.parse::<f32>() {
+            return f.clamp(0.0, 1.0);
+        }
+    }
+    let target = if collapsed { 0.0 } else { 1.0 };
+    match anims.get(path) {
+        Some(a) => {
+            let e = now.duration_since(a.at).as_secs_f32();
+            if e >= 0.45 { target } else { (a.from + (a.to - a.from) * spring(e, 0.34, 0.78)).clamp(0.0, 1.0) }
+        }
+        None => target,
+    }
+}
+
+/// Restart an entry whenever a card's folded state flips.
+fn sync_fold_anims(anims: &mut HashMap<String, FoldAnim>, cards: &[Card], now: std::time::Instant) {
+    for c in cards {
+        let target = if c.collapsed { 0.0 } else { 1.0 };
+        match anims.get(&c.path) {
+            Some(a) if (a.to - target).abs() < 0.001 => {}
+            Some(_) => {
+                let current = open_of(anims, &c.path, c.collapsed, now);
+                anims.insert(c.path.clone(), FoldAnim { from: current, to: target, at: now });
+            }
+            None => {}
+        }
+    }
+    anims.retain(|_, a| a.at.elapsed().as_secs_f32() < 0.6);
 }
 
 fn on_fab(center: (f32, f32), mx: f32, my: f32) -> bool {
@@ -2326,7 +2384,7 @@ fn paint_header(
 
 fn s0(card: &Card) -> f32 { (card.width / CARD_BASE_W).clamp(0.45, 2.4) }
 
-fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, _lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>) {
+fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, _lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>, open: f32) {
     if anim <= 0.02 { return; }
     let style = type_style(&card.file_ext());
     // caption contrast follows the wallpaper under the card
@@ -2335,7 +2393,10 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
         .map(|l| l > 0.58)
         .unwrap_or(false);
     let w = card.width;
-    let h = card.box_h();
+    // height blends between the pill and the full sheet while folding
+    let h_folded = COLLAPSED_H * card.scale();
+    let h_full = card.height.max(h_folded);
+    let h = h_folded + (h_full - h_folded) * open.clamp(0.0, 1.0);
     // interior scale: the card is designed at CARD_BASE_W physical pixels, so
     // zooming keeps proportions and a 150 %+ display scales the whole card.
     let s = (w / CARD_BASE_W).clamp(0.45, 2.4);
@@ -2347,18 +2408,21 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
     // behind the paper read as a frame around it.
 
     // a folded card is just its caption strip on a soft pill
-    if card.collapsed {
+    if open < 0.98 {
         let wv = card.box_w();
         fb.round_rect(x, y + 1.5 * s, wv, h - 1.5 * s, 14.0 * s, (40, 52, 74), fade(22.0));
         let pal = palette();
         let pill_a = if pal.paper == (255, 255, 255) { 78.0 } else { 205.0 };
-        fb.round_rect(x, y, wv, h, 14.0 * s, pal.panel, fade(pill_a));
-        fb.round_rect(x, y, wv, h * 0.5, 14.0 * s, pal.tint, fade(30.0));
+        // squared: the pill stays invisible through most of the open, and only
+        // fades up as the sheet is nearly gone
+        let rest = (1.0 - open).powi(2);
+        fb.round_rect(x, y, wv, h, 14.0 * s, pal.panel, (pill_a * rest * anim).clamp(0.0, 255.0) as u8);
+        fb.round_rect(x, y, wv, h * 0.5, 14.0 * s, pal.tint, (30.0 * rest * anim).clamp(0.0, 255.0) as u8);
     }
 
     // ── header: type badge + filename, hugging the top of the card ──
     // a folded card stops here: caption only, no sheet underneath
-    if card.collapsed {
+    if open < 0.02 {
         paint_header(fb, card, x, y, s, hovered, anim, &style, light_bg);
         return;
     }
@@ -4263,13 +4327,14 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
         let mut bench_thumbs: HashMap<String, Thumbnail> = HashMap::new();
         generate_thumbnails(&config.cards, &mut bench_thumbs);
         let toolbar = toolbar_at(w as f32 * 0.5, h as f32 - 118.0, 1.0, false, false);
+        let folds_empty: HashMap<String, FoldAnim> = HashMap::new();
         let mut bench_cache: CardCache = CardCache::new();
         let t_cold = std::time::Instant::now();
-        render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], toolbar, false, &[], None);
+        render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], &folds_empty, toolbar, false, &[], None);
         let cold = t_cold.elapsed().as_secs_f64() * 1000.0;
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], toolbar, false, &[], None);
+            render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], &folds_empty, toolbar, false, &[], None);
         }
         eprintln!(
             "bench: {:.2} ms/frame, cold first frame {:.1} ms, {} cards",
@@ -4302,6 +4367,8 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     let mut thumbs: HashMap<String, Thumbnail> = HashMap::new();
     // cards born recently, animating in (index, birth instant)
     let mut anims: Vec<(usize, std::time::Instant)> = Vec::new();
+    // per-card fold progress, so opening and closing ease instead of snapping
+    let mut fold_anims: HashMap<String, FoldAnim> = HashMap::new();
     let k = ui_scale();
     // the two pucks sit at the bottom of the *primary* monitor: centring them on
     // the virtual screen would put them on the seam between two displays
@@ -4342,7 +4409,7 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                     let lifted = if is_dragging { press_idx } else { None };
                     render_cards(
                         &mut fb, &mut card_cache, &config.cards, hover_idx, lifted, &thumbs, &anims,
-                        toolbar_at(fab_x, fab_y, k, add_btn_hover, gear_btn_hover),
+                        &fold_anims, toolbar_at(fab_x, fab_y, k, add_btn_hover, gear_btn_hover),
                         drag_active, &guides, edge_hint,
                     );
                     if config.rail {
@@ -4822,6 +4889,12 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                         needs_save = true;
                         window.request_redraw();
                     }
+                }
+                sync_fold_anims(&mut fold_anims, &config.cards, std::time::Instant::now());
+                if !fold_anims.is_empty() {
+                    window.request_redraw();
+                    elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                        std::time::Instant::now() + std::time::Duration::from_millis(16)));
                 }
                 if THEME_CHANGED.swap(false, Ordering::Relaxed) {
                     DARK_MODE.store(detect_dark_mode(), Ordering::Relaxed);

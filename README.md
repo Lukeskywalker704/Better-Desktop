@@ -88,6 +88,12 @@ better-desktop --help      # 快捷键速查
 
 ![深浅色](docs/theme-compare.png)
 
+## 动效
+
+入场和折叠都用解析解阻尼弹簧（response 0.42 s / damping 0.82），没有缓动表也没有过冲抖动；折叠时纸面高度与透明度一起过渡，胶囊在最后 40% 才淡入。
+
+![折叠过渡](docs/fold-spring.png)
+
 ## 多显示器
 
 - 工作区、边距、卡片尺寸都按**各自显示器**的 DPI 计算（`GetDpiForMonitor`），150% 与 100% 并排时观感一致
