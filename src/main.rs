@@ -209,16 +209,16 @@ struct TypeStyle {
 
 fn type_style(ext: &str) -> TypeStyle {
     match ext {
-        "PDF" => TypeStyle { accent: (216, 63, 58), glyph: "P" },
-        "DOCX" | "DOC" => TypeStyle { accent: (36, 98, 234), glyph: "W" },
-        "XLSX" | "XLS" => TypeStyle { accent: (21, 156, 98), glyph: "X" },
-        "PPTX" | "PPT" => TypeStyle { accent: (230, 94, 35), glyph: "P" },
-        "TXT" => TypeStyle { accent: (108, 121, 140), glyph: "T" },
-        "MD" => TypeStyle { accent: (92, 107, 130), glyph: "M" },
+        "PDF" => TypeStyle { accent: (255, 59, 48), glyph: "P" },
+        "DOCX" | "DOC" => TypeStyle { accent: (0, 122, 255), glyph: "W" },
+        "XLSX" | "XLS" => TypeStyle { accent: (52, 199, 89), glyph: "X" },
+        "PPTX" | "PPT" => TypeStyle { accent: (255, 149, 0), glyph: "P" },
+        "TXT" => TypeStyle { accent: (142, 142, 147), glyph: "T" },
+        "MD" => TypeStyle { accent: (142, 142, 147), glyph: "M" },
         "PNG" | "JPG" | "JPEG" | "GIF" | "BMP" | "WEBP" => {
-            TypeStyle { accent: (110, 95, 222), glyph: "I" }
+            TypeStyle { accent: (88, 86, 214), glyph: "I" }
         }
-        _ => TypeStyle { accent: (148, 160, 176), glyph: "F" },
+        _ => TypeStyle { accent: (142, 142, 147), glyph: "F" },
     }
 }
 
@@ -377,6 +377,34 @@ impl Framebuffer {
             p[3] = 255;
         }
     }
+    /// Shadow with a soft falloff: the rect is the core and `blur` pixels of
+    /// smoothstep fade surround it, so two stacked layers read like a real drop
+    /// shadow (a wide diffuse one and a tight contact one).
+    fn soft_rect(&mut self, x: f32, y: f32, w: f32, h: f32, rad: f32, blur: f32, c: (u8, u8, u8), a: f32) {
+        if a <= 0.5 || blur <= 0.2 || w <= 0.0 || h <= 0.0 { return; }
+        let hw = w * 0.5;
+        let hh = h * 0.5;
+        let cx = x + hw;
+        let cy = y + hh;
+        let x0 = (x - blur).floor() as i32;
+        let y0 = (y - blur).floor() as i32;
+        let x1 = (x + w + blur).ceil() as i32;
+        let y1 = (y + h + blur).ceil() as i32;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let qx = ((px as f32 + 0.5) - cx).abs() - (hw - rad);
+                let qy = ((py as f32 + 0.5) - cy).abs() - (hh - rad);
+                let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt()
+                    + qx.max(qy).min(0.0) - rad;
+                let t = ((d + blur) / (2.0 * blur)).clamp(0.0, 1.0);
+                let cov = 1.0 - t * t * (3.0 - 2.0 * t);
+                if cov > 0.01 {
+                    self.set_pixel(px, py, c.0, c.1, c.2, (a * cov) as u8);
+                }
+            }
+        }
+    }
+
     /// A sheet whose outer `band` pixels are translucent, so the desktop shows
     /// through its edge the way light passes through the rim of a glass slab.
     /// The opaque face is filled span by span; only the rim costs per-pixel
@@ -1814,7 +1842,7 @@ fn draw_text(fb: &mut Framebuffer, text: &str, x: i32, y: i32, max_w: i32, size:
 
 fn render_text_to_bitmap(text: &str, max_w: i32, size: i32, weight: i32, align: u8) -> TextBitmap {
     let w = max_w.max(1);
-    let h = size + 10;
+    let h = size + 12;
     let mut tb = TextBitmap { w: w as u32, h: h as u32, alpha: vec![0; (w * h) as usize] };
     unsafe {
         let hdc_screen = GetDC(std::ptr::null_mut());
@@ -1846,7 +1874,7 @@ fn render_text_to_bitmap(text: &str, max_w: i32, size: i32, weight: i32, align: 
         let old_bmp = SelectObject(hdc, dib as *mut _);
         let font = CreateFontW(
             -size, 0, 0, 0, weight, 0, 0, 0,
-            1, 0, 0, 5, 0, wide(UI_FONT).as_ptr(),
+            1, 0, 0, 5, 0, wide(UI_FONT).as_ptr(), // CLEARTYPE: its solid cores are what the alpha extraction needs
         );
         let old_font = SelectObject(hdc, font as *mut _);
         SetBkMode(hdc, 1); // TRANSPARENT
@@ -2002,7 +2030,7 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
         return;
     }
 
-    let pad = (16.0 * s).ceil() as i32;
+    let pad = (30.0 * s).ceil() as i32;
     let key = format!(
         "{}|{}x{}|{}{}{}|{}", card.path, w as i32, h as i32,
         hovered as u8, lifted as u8, card.collapsed as u8, thumb_sig(thumb)
@@ -2017,7 +2045,9 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
     paint_card(&mut scratch, card, pad as f32, pad as f32, hovered, lifted, 1.0, thumb);
     let img = CardImage {
         w: bw, h: bh, px: std::mem::take(&mut scratch.pixels),
-        body: (pad, pad, w as i32, h as i32),
+        // the paper no longer has a translucent band, so nothing needs to be
+        // composited against the frosted backdrop: plain alpha over the screen
+        body: (0, 0, 0, 0),
     };
     blit_card(fb, &img, dx as i32 - pad, dy as i32 - pad, backdrop);
     if cache.len() > 48 { cache.clear(); }
@@ -2084,7 +2114,53 @@ const THUMB_PX: u32 = 640;
 
 /// Paint one card — shadows, tinted body, page and text — with its top-left at
 /// (x, y). This is the expensive path; draw_card caches its result.
-fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, _hovered: bool, _lifted: bool, anim: f32, thumb: Option<&Thumbnail>) {
+/// Caption row: type badge, filename, fold control. Drawn *after* the paper so
+/// the paper's shadow never darkens the text.
+#[allow(clippy::too_many_arguments)]
+fn paint_header(
+    fb: &mut Framebuffer, card: &Card, x: f32, y: f32, s: f32,
+    hovered: bool, anim: f32, style: &TypeStyle,
+) {
+    let pad = CARD_PAD * s;
+    let fade = |v: f32| (v * anim).clamp(0.0, 255.0) as u8;
+    let fs = |v: f32| ((v * s).round() as i32).max(7);
+    let by = y + 6.0 * s;
+    let badge = 30.0 * s;
+    fb.round_rect(x + pad, by + 1.5 * s, badge, badge, 9.0 * s, style.accent, fade(50.0));
+    fb.round_rect(x + pad, by, badge, badge, 9.0 * s, style.accent, fade(255.0));
+    draw_text(fb, style.glyph, (x + pad) as i32, (by + 3.0 * s) as i32, badge as i32, fs(15.0), 700, (255, 255, 255), 1);
+    // the caption sits on whatever the desktop shows, so it carries its own
+    // contrast: white letters over a soft dark shadow
+    let name = card.file_name();
+    let tx = (x + pad + badge + 10.0 * s) as i32;
+    let ty = (by + 3.5 * s) as i32;
+    let btn = 22.0 * s;
+    let wv = card.box_w();
+    let tw = (wv - pad * 2.0 - badge - 10.0 * s - btn - 8.0 * s) as i32;
+    // stacked shadow copies also fill the holes ClearType leaves in a single
+    // pass of alpha-extracted glyphs, so the caption stays solid on any desktop
+    for (dx, dy) in [(0.0f32, 1.6f32), (0.7, 0.8), (1.3, 0.0)] {
+        draw_text(fb, &name, tx + (dx * s) as i32, ty + (dy * s) as i32, tw, fs(14.0), 700, (10, 12, 18), 0);
+    }
+    draw_text(fb, &name, tx, ty, tw, fs(14.0), 700, (255, 255, 255), 0);
+
+    // fold / unfold control: appears on hover, like the corner control of a
+    // macOS widget, and is always visible on an already folded card
+    if wv > 140.0 * s && (hovered || card.collapsed) {
+        let bx = x + wv - pad - btn;
+        fb.round_rect(bx, by + 1.0 * s, btn, btn, btn * 0.5, (0, 0, 0), fade(18.0));
+        fb.round_rect(bx, by, btn, btn, btn * 0.5, (255, 255, 255), fade(190.0));
+        draw_chevron(
+            fb, bx + btn * 0.5, by + btn * 0.5,
+            btn * 0.28, btn * 0.16,
+            if card.collapsed { -1.0 } else { 1.0 },
+            (60, 60, 67), fade(220.0),
+        );
+    }
+
+}
+
+fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, _lifted: bool, anim: f32, thumb: Option<&Thumbnail>) {
     if anim <= 0.02 { return; }
     let style = type_style(&card.file_ext());
     let w = card.width;
@@ -2093,9 +2169,7 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, _hovered: bool,
     // zooming keeps proportions and a 150 %+ display scales the whole card.
     let s = (w / CARD_BASE_W).clamp(0.45, 2.4);
 
-    let pad = CARD_PAD * s;
     let fade = |v: f32| (v * anim).clamp(0.0, 255.0) as u8;
-    let fs = |v: f32| ((v * s).round() as i32).max(7);
 
     // No card panel at all: only the paper and the caption above it. The old
     // glass body, its shadows and its specular are gone on purpose — anything
@@ -2110,39 +2184,9 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, _hovered: bool,
     }
 
     // ── header: type badge + filename, hugging the top of the card ──
-    let by = y + 6.0 * s;
-    let badge = 30.0 * s;
-    fb.round_rect(x + pad, by + 1.5 * s, badge, badge, 9.0 * s, style.accent, fade(50.0));
-    fb.round_rect(x + pad, by, badge, badge, 9.0 * s, style.accent, fade(255.0));
-    draw_text(fb, style.glyph, (x + pad) as i32, (by + 3.0 * s) as i32, badge as i32, fs(15.0), 700, (255, 255, 255), 1);
-    // the caption sits on whatever the desktop shows, so it carries its own
-    // contrast: white letters over a soft dark shadow
-    let name = card.file_name();
-    let tx = (x + pad + badge + 10.0 * s) as i32;
-    let ty = (by + 3.5 * s) as i32;
-    let btn = 30.0 * s;
-    let wv = card.box_w();
-    let tw = (wv - pad * 2.0 - badge - 10.0 * s - btn - 8.0 * s) as i32;
-    for (dx, dy) in [(0, 2), (1, 1), (2, 0)] {
-        draw_text(fb, &name, tx + (dx as f32 * s) as i32, ty + (dy as f32 * s) as i32, tw, fs(14.0), 600, (16, 20, 28), 0);
-    }
-    draw_text(fb, &name, tx, ty, tw, fs(14.0), 600, (255, 255, 255), 0);
-
-    // fold / unfold button, always drawn so the target is obvious
-    if wv > 140.0 * s {
-        let bx = x + wv - pad - btn;
-        fb.round_rect(bx, by + 1.0 * s, btn, btn, btn * 0.5, (40, 52, 74), fade(24.0));
-        fb.round_rect(bx, by, btn, btn, btn * 0.5, (255, 255, 255), fade(165.0));
-        draw_chevron(
-            fb, bx + btn * 0.5, by + btn * 0.5,
-            btn * 0.26, btn * 0.15,
-            if card.collapsed { -1.0 } else { 1.0 },
-            (48, 54, 66), fade(235.0),
-        );
-    }
-
     // a folded card stops here: caption only, no sheet underneath
     if card.collapsed {
+        paint_header(fb, card, x, y, s, hovered, anim, &style);
         return;
     }
 
@@ -2160,12 +2204,13 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, _hovered: bool,
         }
         _ => (area_h, area_y),
     };
-    let band = 6.0 * s;
+    let band = 1.2 * s; // a hairline, not a coloured rim
     if pw > 24.0 * s && ph > 24.0 * s {
-        // paper: the one solid surface on the card — no frame, but its edge is
-        // glass, so it picks up the desktop behind it
-        fb.round_rect(px + 2.0 * s, py + 3.0 * s, pw - 4.0 * s, ph + s, 12.0 * s, (40, 52, 74), fade(26.0));
-        fb.glass_paper(px, py, pw, ph, 12.0 * s, band, anim);
+        // two-layer drop shadow: a wide diffuse one and a tight contact one, the
+        // way a sheet of paper reads on a desktop
+        fb.soft_rect(px, py + 8.0 * s, pw, ph, 14.0 * s, 24.0 * s, (0, 0, 0), 46.0 * anim);
+        fb.soft_rect(px, py + 1.0 * s, pw, ph, 14.0 * s, 3.0 * s, (0, 0, 0), 34.0 * anim);
+        fb.glass_paper(px, py, pw, ph, 14.0 * s, band, anim);
         let blocks = doc_blocks(&card.path);
         let ext = card.file_ext();
         let is_slide = matches!(ext.as_str(), "PPTX" | "PPTM" | "POTX" | "PPT");
@@ -2195,6 +2240,7 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, _hovered: bool,
             draw_placeholder_page(fb, card, &style, px, py, pw, ph, anim, s);
         }
     }
+    paint_header(fb, card, x, y, s, hovered, anim, &style);
 }
 
 /// Small chevron; `dir` +1 points down (fold), -1 points up (unfold).
@@ -2218,7 +2264,7 @@ fn draw_chevron(
 /// Screen rect of a card's fold button (matches what `paint_card` draws).
 fn fold_button_rect(card: &Card) -> (f32, f32, f32, f32) {
     let s = card.scale();
-    let btn = 30.0 * s;
+    let btn = 22.0 * s;
     (card.visual_x() + card.box_w() - CARD_PAD * s - btn, card.y + 6.0 * s, btn, btn)
 }
 
@@ -2313,8 +2359,8 @@ fn draw_doc_page(fb: &mut Framebuffer, blocks: &[Block], style: &TypeStyle, px: 
     let iw = pw - 30.0 * s;
     let bottom = py + ph - 10.0 * s;
     let mut y = py + 15.0 * s;
-    let ink = (40, 45, 56);
-    let body_ink = (62, 68, 80);
+    let ink = (29, 29, 31);
+    let body_ink = (110, 110, 118);
 
     for block in blocks {
         if y >= bottom { break; }

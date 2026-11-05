@@ -70,6 +70,12 @@ better-desktop --help      # 快捷键速查
 
 移除入口：齿轮菜单里再点一次，或 `better-desktop.exe --uninstall-menu`。
 
+## 视觉
+
+![改版后的卡片](docs/apple-style-after.png)
+
+按 `docs/apple-style-suggestions.md` 的清单做了第一轮：纸面改成 1px 白色描边 + 双层柔和阴影、卡片自动按 Apple 系统色区分类型、折叠按钮改为悬停才出现、正文改用中性黑文字、缓存外边距加大到 30×s 以容纳阴影。
+
 ## 多显示器
 
 - 工作区、边距、卡片尺寸都按**各自显示器**的 DPI 计算（`GetDpiForMonitor`），150% 与 100% 并排时观感一致
