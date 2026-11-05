@@ -53,6 +53,10 @@ print("base:", base, "changed:", len(changed))
 
 entries = []
 for path in changed:
+    if not os.path.exists(path):
+        # deleted in this commit
+        entries.append({"path": path.replace("\\", "/"), "mode": "100644", "type": "blob", "sha": None})
+        continue
     with open(path, "rb") as fh:
         blob = call("POST", f"{API}/git/blobs",
                     {"content": base64.b64encode(fh.read()).decode(), "encoding": "base64"})

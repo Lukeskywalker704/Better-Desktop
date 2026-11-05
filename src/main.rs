@@ -29,7 +29,7 @@ use winapi::{
             AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
             CloseClipboard, DestroyMenu, DrawTextW, EnumDisplayMonitors, FindWindowW, GetClassNameW,
             GetClipboardData, GetCursorPos, GetForegroundWindow, GetMonitorInfoW, keybd_event,
-            MessageBoxW, OpenClipboard, RegisterHotKey,
+            DestroyIcon, GetIconInfo, MessageBoxW, OpenClipboard, RegisterHotKey,
             GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, LoadImageW, MonitorFromPoint, SendMessageW,
             MONITORINFO, PostMessageW,
             PrintWindow, RegisterClassW,
@@ -506,6 +506,25 @@ struct Backdrop { w: u32, h: u32, px: Vec<u8> } // straight BGRA, 1/4 scale
 static BACKDROP: Mutex<Option<Backdrop>> = Mutex::new(None);
 
 impl Backdrop {
+    /// Mean luminance (0..1) under a screen rect.
+    fn luminance(&self, x: f32, y: f32, w: f32, h: f32) -> f32 {
+        let step = (w / 8.0).max(4.0) as i32;
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        let mut py = y as i32;
+        while py < (y + h) as i32 {
+            let mut px = x as i32;
+            while px < (x + w) as i32 {
+                let (r, g, b) = self.at(px, py);
+                sum += 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+                n += 1.0;
+                px += step;
+            }
+            py += (h / 3.0).max(4.0) as i32;
+        }
+        if n == 0.0 { 0.0 } else { sum / n / 255.0 }
+    }
+
     #[inline]
     fn at(&self, x: i32, y: i32) -> (u8, u8, u8) {
         let sx = (x / 4).clamp(0, self.w as i32 - 1) as usize;
@@ -769,6 +788,7 @@ fn box_blur(px: &mut [u8], w: usize, h: usize, radius: usize) {
 
 // ── Shell thumbnails ─────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Thumbnail { width: u32, height: u32, data: Vec<u8> } // BGRA
 
 impl Thumbnail {
@@ -1263,6 +1283,58 @@ fn pptx_slide_image(path: &str) -> Option<Thumbnail> {
 }
 
 /// Biggest picture referenced by one slide part (`kind` = slides / slideLayouts).
+/// Icons are per file type, so one cache entry per extension is enough.
+static ICON_CACHE: std::sync::Mutex<Option<HashMap<String, Option<Thumbnail>>>> =
+    std::sync::Mutex::new(None);
+
+/// The system icon Windows itself shows for this kind of file, at 32 px.
+fn shell_icon(ext: &str) -> Option<Thumbnail> {
+    {
+        let mut guard = ICON_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some(hit) = cache.get(ext) {
+            return hit.clone();
+        }
+    }
+    let icon = unsafe { load_shell_icon(ext) };
+    if let Some(mut guard) = ICON_CACHE.lock().ok() {
+        guard.get_or_insert_with(HashMap::new).insert(ext.to_string(), icon.clone());
+    }
+    icon
+}
+
+unsafe fn load_shell_icon(ext: &str) -> Option<Thumbnail> {
+    use winapi::um::shellapi::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES};
+    // a made-up name gives the icon for the *type*, without touching the disk
+    let probe = wide(&format!("file.{}", ext.to_lowercase()));
+    let mut info: SHFILEINFOW = std::mem::zeroed();
+    let flags = SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES;
+    let ok = SHGetFileInfoW(
+        probe.as_ptr(),
+        0x0000_0080, // FILE_ATTRIBUTE_NORMAL
+        &mut info,
+        std::mem::size_of::<SHFILEINFOW>() as u32,
+        flags,
+    );
+    if ok == 0 || info.hIcon.is_null() {
+        return None;
+    }
+    let mut ii: winapi::um::winuser::ICONINFO = std::mem::zeroed();
+    let mut out = None;
+    if GetIconInfo(info.hIcon, &mut ii) != 0 {
+        if !ii.hbmColor.is_null() {
+            let hb = windows::Win32::Graphics::Gdi::HBITMAP(ii.hbmColor as *mut core::ffi::c_void);
+            out = hbitmap_to_bgra(hb);
+            DeleteObject(ii.hbmColor as winapi::shared::windef::HGDIOBJ);
+        }
+        if !ii.hbmMask.is_null() {
+            DeleteObject(ii.hbmMask as winapi::shared::windef::HGDIOBJ);
+        }
+    }
+    DestroyIcon(info.hIcon);
+    out
+}
+
 fn pptx_picture_of(path: &str, kind: &str, stem: &str) -> Option<Thumbnail> {
     let rels_name = format!("ppt/{kind}/_rels/{stem}.xml.rels");
     let part_name = format!("ppt/{kind}/{stem}.xml");
@@ -2026,7 +2098,7 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
 
     if anim < 0.999 {
         // transient entrance animation: paint straight onto the frame
-        paint_card(fb, card, dx, dy, hovered, lifted, anim, thumb);
+        paint_card(fb, card, dx, dy, hovered, lifted, anim, thumb, backdrop);
         return;
     }
 
@@ -2042,7 +2114,7 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
     let bw = w as i32 + pad * 2;
     let bh = h as i32 + pad * 2;
     let mut scratch = Framebuffer::new(bw.max(1) as u32, bh.max(1) as u32);
-    paint_card(&mut scratch, card, pad as f32, pad as f32, hovered, lifted, 1.0, thumb);
+    paint_card(&mut scratch, card, pad as f32, pad as f32, hovered, lifted, 1.0, thumb, backdrop);
     let img = CardImage {
         w: bw, h: bh, px: std::mem::take(&mut scratch.pixels),
         // the paper no longer has a translucent band, so nothing needs to be
@@ -2119,16 +2191,21 @@ const THUMB_PX: u32 = 640;
 #[allow(clippy::too_many_arguments)]
 fn paint_header(
     fb: &mut Framebuffer, card: &Card, x: f32, y: f32, s: f32,
-    hovered: bool, anim: f32, style: &TypeStyle,
+    hovered: bool, anim: f32, style: &TypeStyle, light_bg: bool,
 ) {
     let pad = CARD_PAD * s;
     let fade = |v: f32| (v * anim).clamp(0.0, 255.0) as u8;
     let fs = |v: f32| ((v * s).round() as i32).max(7);
     let by = y + 6.0 * s;
     let badge = 30.0 * s;
-    fb.round_rect(x + pad, by + 1.5 * s, badge, badge, 9.0 * s, style.accent, fade(50.0));
-    fb.round_rect(x + pad, by, badge, badge, 9.0 * s, style.accent, fade(255.0));
-    draw_text(fb, style.glyph, (x + pad) as i32, (by + 3.0 * s) as i32, badge as i32, fs(15.0), 700, (255, 255, 255), 1);
+    if let Some(icon) = shell_icon(&card.file_ext()) {
+        // the same icon Explorer shows, rather than a letter stand-in
+        draw_thumbnail(fb, &icon, (x + pad) as i32, by as i32, badge as i32, badge as i32);
+    } else {
+        fb.round_rect(x + pad, by + 1.5 * s, badge, badge, 9.0 * s, style.accent, fade(50.0));
+        fb.round_rect(x + pad, by, badge, badge, 9.0 * s, style.accent, fade(255.0));
+        draw_text(fb, style.glyph, (x + pad) as i32, (by + 3.0 * s) as i32, badge as i32, fs(15.0), 700, (255, 255, 255), 1);
+    }
     // the caption sits on whatever the desktop shows, so it carries its own
     // contrast: white letters over a soft dark shadow
     let name = card.file_name();
@@ -2137,12 +2214,12 @@ fn paint_header(
     let btn = 22.0 * s;
     let wv = card.box_w();
     let tw = (wv - pad * 2.0 - badge - 10.0 * s - btn - 8.0 * s) as i32;
-    // stacked shadow copies also fill the holes ClearType leaves in a single
-    // pass of alpha-extracted glyphs, so the caption stays solid on any desktop
-    for (dx, dy) in [(0.0f32, 1.6f32), (0.7, 0.8), (1.3, 0.0)] {
-        draw_text(fb, &name, tx + (dx * s) as i32, ty + (dy * s) as i32, tw, fs(14.0), 700, (10, 12, 18), 0);
-    }
-    draw_text(fb, &name, tx, ty, tw, fs(14.0), 700, (255, 255, 255), 0);
+    // contrast follows the wallpaper under the caption: dark ink on a light
+    // desktop, white ink (with a soft shadow) on a dark one
+    let ink = if light_bg { (28, 30, 36) } else { (255, 255, 255) };
+    // no stacked shadow: ClearType leaves thin rows in a single pass, and a copy
+    // behind them reads as doubled glyphs on a busy wallpaper
+    draw_text(fb, &name, tx, ty, tw, fs(14.0), 600, ink, 0);
 
     // fold / unfold control: appears on hover, like the corner control of a
     // macOS widget, and is always visible on an already folded card
@@ -2160,9 +2237,16 @@ fn paint_header(
 
 }
 
-fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, _lifted: bool, anim: f32, thumb: Option<&Thumbnail>) {
+fn s0(card: &Card) -> f32 { (card.width / CARD_BASE_W).clamp(0.45, 2.4) }
+
+fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, _lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>) {
     if anim <= 0.02 { return; }
     let style = type_style(&card.file_ext());
+    // caption contrast follows the wallpaper under the card
+    let light_bg = backdrop
+        .map(|b| b.luminance(x + CARD_PAD * s0(card), y + 6.0 * s0(card), card.box_w(), 40.0))
+        .map(|l| l > 0.58)
+        .unwrap_or(false);
     let w = card.width;
     let h = card.box_h();
     // interior scale: the card is designed at CARD_BASE_W physical pixels, so
@@ -2186,7 +2270,7 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
     // ── header: type badge + filename, hugging the top of the card ──
     // a folded card stops here: caption only, no sheet underneath
     if card.collapsed {
-        paint_header(fb, card, x, y, s, hovered, anim, &style);
+        paint_header(fb, card, x, y, s, hovered, anim, &style, light_bg);
         return;
     }
 
@@ -2240,7 +2324,7 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
             draw_placeholder_page(fb, card, &style, px, py, pw, ph, anim, s);
         }
     }
-    paint_header(fb, card, x, y, s, hovered, anim, &style);
+    paint_header(fb, card, x, y, s, hovered, anim, &style, light_bg);
 }
 
 /// Small chevron; `dir` +1 points down (fold), -1 points up (unfold).
@@ -3659,7 +3743,10 @@ impl Presenter {
     fn present(&mut self, hwnd: HWND, pos: (i32, i32), fb: &Framebuffer) {
         if fb.width == 0 || fb.height == 0 { return; }
         if std::env::var("BD_DUMP").is_ok() {
+            // dump mode renders exactly one frame and leaves: it must never keep
+            // running as a second overlay
             dump_bmp(config_dir().join("frame.bmp"), fb);
+            std::process::exit(0);
         }
         self.resize(fb.width, fb.height);
         unsafe {
