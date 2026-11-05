@@ -24,7 +24,7 @@ use winapi::{
             BI_RGB, DIB_RGB_COLORS, SRCCOPY,
         },
         winnt::{KEY_WRITE, REG_SZ},
-        winreg::{RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_CURRENT_USER},
+        winreg::{RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegSetValueExW, HKEY_CURRENT_USER},
         winuser::{
             AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
             CloseClipboard, DestroyMenu, DrawTextW, EnumDisplayMonitors, FindWindowW, GetClassNameW,
@@ -405,7 +405,7 @@ impl Framebuffer {
         let face_y1 = (iy + ih).floor() as i32;
         for py in face_y0..face_y1 {
             if let Some((sx, ex)) = rounded_span(ix, iy, iw, ih, irad, py) {
-                self.span_opaque(sx.ceil() as i32, ex.floor() as i32, py, (255, 255, 255));
+                self.span_opaque(sx.ceil() as i32, ex.floor() as i32, py, palette().paper);
             }
         }
 
@@ -454,7 +454,10 @@ impl Framebuffer {
         if depth < 1.1 { a = a.max(205.0); }
         a *= cov;
         let a = (a * anim).clamp(0.0, 255.0) as u8;
-        if a > 0 { self.set_pixel(px, py, 255, 255, 255, a); }
+        if a > 0 {
+            let e = palette().edge;
+            self.set_pixel(px, py, e.0, e.1, e.2, a);
+        }
     }
 }
 
@@ -2162,9 +2165,10 @@ fn draw_toolbar(fb: &mut Framebuffer, tb: Toolbar) {
     // a soft shadow instead of the old stacked rings
     fb.soft_rect(x, y + 2.0 * k, w, h, rad, 14.0 * k, (0, 0, 0), 40.0);
     // frosted body: near-opaque white with a lighter upper half
-    fb.round_rect(x, y, w, h, rad, (255, 255, 255), 240);
-    fb.round_rect(x, y, w, h * 0.55, rad, (255, 255, 255), 40);
-    fb.round_rect_stroke(x + 0.5, y + 0.5, w - 1.0, h - 1.0, rad, 1.0, (28, 38, 58), 30);
+    let pal = palette();
+    fb.round_rect(x, y, w, h, rad, pal.panel, 240);
+    fb.round_rect(x, y, w, h * 0.55, rad, pal.tint, 40);
+    fb.round_rect_stroke(x + 0.5, y + 0.5, w - 1.0, h - 1.0, rad, 1.0, pal.tint, 30);
     // the hovered half gets a subtle well, like a pressed segment
     let inset = 4.0 * k;
     if tb.add_hover {
@@ -2174,7 +2178,7 @@ fn draw_toolbar(fb: &mut Framebuffer, tb: Toolbar) {
         fb.round_rect(x + w * 0.5 + inset, y + inset, w * 0.5 - inset * 2.0, h - inset * 2.0, rad - inset, (28, 38, 58), 18);
     }
     fb.round_rect(x + w * 0.5 - 0.5, y + h * 0.26, 1.0, h * 0.48, 0.5, (28, 38, 58), 26);
-    let ink = |hover: bool| if hover { (32, 36, 44) } else { (86, 92, 104) };
+    let ink = |hover: bool| if hover { pal.ink } else { pal.glyph };
     // plus
     let (ax, ay) = tb.add_center();
     let (arm, thick) = (8.0 * k, 1.2 * k);
@@ -2189,6 +2193,79 @@ fn draw_toolbar(fb: &mut Framebuffer, tb: Toolbar) {
     }
 }
 
+
+/// Windows' app theme decides the sheet: light paper with dark ink, or the
+/// near-black sheet macOS uses with light ink.
+#[derive(Clone, Copy)]
+struct Palette {
+    paper: (u8, u8, u8),
+    ink: (u8, u8, u8),
+    ink2: (u8, u8, u8),
+    rule: (u8, u8, u8),
+    panel: (u8, u8, u8),
+    glyph: (u8, u8, u8),
+    edge: (u8, u8, u8),
+    tint: (u8, u8, u8),
+}
+
+static DARK_MODE: AtomicBool = AtomicBool::new(false);
+static THEME_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn palette() -> Palette {
+    if DARK_MODE.load(Ordering::Relaxed) {
+        Palette {
+            paper: (28, 28, 30),      // #1C1C1E
+            ink: (242, 242, 247),     // label
+            ink2: (152, 152, 159),    // secondaryLabel
+            rule: (72, 72, 78),       // separator
+            panel: (44, 44, 48),      // capsule / pill body
+            glyph: (210, 210, 216),
+            edge: (255, 255, 255),
+            tint: (255, 255, 255),
+        }
+    } else {
+        Palette {
+            paper: (255, 255, 255),
+            ink: (29, 29, 31),
+            ink2: (110, 110, 118),
+            rule: (228, 228, 232),
+            panel: (255, 255, 255),
+            glyph: (86, 92, 104),
+            edge: (255, 255, 255),
+            tint: (28, 38, 58),
+        }
+    }
+}
+
+/// `AppsUseLightTheme` under HKCU\...\Themes\Personalize; BD_DARK/BD_LIGHT
+/// force either mode, which is what the render checks use.
+fn detect_dark_mode() -> bool {
+    if std::env::var("BD_DARK").is_ok() {
+        return true;
+    }
+    if std::env::var("BD_LIGHT").is_ok() {
+        return false;
+    }
+    unsafe {
+        let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+        let name = wide("AppsUseLightTheme");
+        let mut value: u32 = 1;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let rc = RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            name.as_ptr(),
+            0x0000_0010, // RRF_RT_REG_DWORD
+            std::ptr::null_mut(),
+            &mut value as *mut u32 as *mut winapi::ctypes::c_void,
+            &mut size,
+        );
+        if rc != 0 {
+            return false;
+        }
+        value == 0
+    }
+}
 
 const CARD_PAD: f32 = 15.0;
 /// shell thumbnails are fetched at this size (a card page is ~570px wide max)
@@ -2236,12 +2313,12 @@ fn paint_header(
     if wv > 140.0 * s && (hovered || card.collapsed) {
         let bx = x + wv - pad - btn;
         fb.round_rect(bx, by + 1.0 * s, btn, btn, btn * 0.5, (0, 0, 0), fade(18.0));
-        fb.round_rect(bx, by, btn, btn, btn * 0.5, (255, 255, 255), fade(190.0));
+        fb.round_rect(bx, by, btn, btn, btn * 0.5, palette().panel, fade(190.0));
         draw_chevron(
             fb, bx + btn * 0.5, by + btn * 0.5,
             btn * 0.28, btn * 0.16,
             if card.collapsed { -1.0 } else { 1.0 },
-            (60, 60, 67), fade(220.0),
+            palette().glyph, fade(220.0),
         );
     }
 
@@ -2273,8 +2350,10 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
     if card.collapsed {
         let wv = card.box_w();
         fb.round_rect(x, y + 1.5 * s, wv, h - 1.5 * s, 14.0 * s, (40, 52, 74), fade(22.0));
-        fb.round_rect(x, y, wv, h, 14.0 * s, (255, 255, 255), fade(78.0));
-        fb.round_rect(x, y, wv, h * 0.5, 14.0 * s, (255, 255, 255), fade(30.0));
+        let pal = palette();
+        let pill_a = if pal.paper == (255, 255, 255) { 78.0 } else { 205.0 };
+        fb.round_rect(x, y, wv, h, 14.0 * s, pal.panel, fade(pill_a));
+        fb.round_rect(x, y, wv, h * 0.5, 14.0 * s, pal.tint, fade(30.0));
     }
 
     // ── header: type badge + filename, hugging the top of the card ──
@@ -2453,8 +2532,9 @@ fn draw_doc_page(fb: &mut Framebuffer, blocks: &[Block], style: &TypeStyle, px: 
     let iw = pw - 30.0 * s;
     let bottom = py + ph - 10.0 * s;
     let mut y = py + 15.0 * s;
-    let ink = (29, 29, 31);
-    let body_ink = (110, 110, 118);
+    let pal = palette();
+    let ink = pal.ink;
+    let body_ink = pal.ink2;
 
     for block in blocks {
         if y >= bottom { break; }
@@ -2463,7 +2543,7 @@ fn draw_doc_page(fb: &mut Framebuffer, blocks: &[Block], style: &TypeStyle, px: 
                 let title = matches!(block, Block::Title(_));
                 let size = if title { 15.5 } else { 12.5 } * s;
                 let weight = if title { 700 } else { 600 };
-                let color = if title { ink } else { (52, 58, 70) };
+                let color = if title { ink } else { pal.ink };
                 // bold glyphs run wider than the estimate: leave it headroom so
                 // lines break instead of being clipped
                 for line in wrap_lines(text, size, iw * 0.93) {
@@ -2497,7 +2577,8 @@ fn draw_doc_page(fb: &mut Framebuffer, blocks: &[Block], style: &TypeStyle, px: 
                 for (ri, row) in rows.iter().enumerate() {
                     if y + rh > bottom { return; }
                     if ri == 0 {
-                        fb.round_rect(ix, y, iw, rh, 3.0 * s, style.accent, 36);
+                        let head = if palette().paper == (255, 255, 255) { style.accent } else { (255, 255, 255) };
+                        fb.round_rect(ix, y, iw, rh, 3.0 * s, head, 26);
                     }
                     for c in 0..cols {
                         if let Some(cell) = row.get(c) {
@@ -2511,7 +2592,7 @@ fn draw_doc_page(fb: &mut Framebuffer, blocks: &[Block], style: &TypeStyle, px: 
                         }
                     }
                     y += rh;
-                    fb.round_rect(ix, y - 0.5, iw, 1.0, 0.5, (0, 0, 0), 22);
+                    fb.round_rect(ix, y - 0.5, iw, 1.0, 0.5, palette().rule, 120);
                 }
             }
         }
@@ -3374,6 +3455,10 @@ static FOLD_REQUEST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32
 static HOTKEY_TIDY: AtomicBool = AtomicBool::new(false);
 
 extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == 0x001A {
+        // WM_SETTINGCHANGE: light/dark may have flipped
+        THEME_CHANGED.store(true, Ordering::Relaxed);
+    }
     if msg == 0x02E0 {
         return 0; // WM_DPICHANGED
     }
@@ -4022,6 +4107,7 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
 
     // Physical-pixel UI scale for this display; cards and controls follow it so
     // the layout keeps the same apparent size at 125 % / 150 % / 200 %.
+    DARK_MODE.store(detect_dark_mode(), Ordering::Relaxed);
     let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96);
     UI_SCALE_MILLI.store(((dpi as f32 / 96.0) * 1000.0) as u32, Ordering::Relaxed);
 
@@ -4736,6 +4822,11 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                         needs_save = true;
                         window.request_redraw();
                     }
+                }
+                if THEME_CHANGED.swap(false, Ordering::Relaxed) {
+                    DARK_MODE.store(detect_dark_mode(), Ordering::Relaxed);
+                    card_cache.clear();
+                    window.request_redraw();
                 }
                 let fold_req = FOLD_REQUEST.swap(0, Ordering::Relaxed);
                 if fold_req != 0 {

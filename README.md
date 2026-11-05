@@ -82,6 +82,12 @@ better-desktop --help      # 快捷键速查
 
 ![工具栏](docs/toolbar.png)
 
+## 深浅色
+
+跟随系统（`AppsUseLightTheme`）：浅色是白纸黑字，深色是 #1C1C1E 纸面 + 浅色文字，工具栏与胶囊同步换色。系统切换主题时自动重绘。
+
+![深浅色](docs/theme-compare.png)
+
 ## 多显示器
 
 - 工作区、边距、卡片尺寸都按**各自显示器**的 DPI 计算（`GetDpiForMonitor`），150% 与 100% 并排时观感一致
