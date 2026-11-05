@@ -2401,23 +2401,21 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
     // zooming keeps proportions and a 150 %+ display scales the whole card.
     let s = (w / CARD_BASE_W).clamp(0.45, 2.4);
 
-    let fade = |v: f32| (v * anim).clamp(0.0, 255.0) as u8;
 
     // No card panel at all: only the paper and the caption above it. The old
     // glass body, its shadows and its specular are gone on purpose — anything
     // behind the paper read as a frame around it.
 
-    // a folded card is just its caption strip on a soft pill
+    // a folded card is just its caption row: no slab behind it, the icon carries
+    // the identity and the caption ink adapts to the wallpaper. Only a hover
+    // shows where the hit area is.
     if open < 0.98 {
         let wv = card.box_w();
-        fb.round_rect(x, y + 1.5 * s, wv, h - 1.5 * s, 14.0 * s, (40, 52, 74), fade(22.0));
-        let pal = palette();
-        let pill_a = if pal.paper == (255, 255, 255) { 78.0 } else { 205.0 };
-        // squared: the pill stays invisible through most of the open, and only
-        // fades up as the sheet is nearly gone
         let rest = (1.0 - open).powi(2);
-        fb.round_rect(x, y, wv, h, 14.0 * s, pal.panel, (pill_a * rest * anim).clamp(0.0, 255.0) as u8);
-        fb.round_rect(x, y, wv, h * 0.5, 14.0 * s, pal.tint, (30.0 * rest * anim).clamp(0.0, 255.0) as u8);
+        if hovered {
+            let pal = palette();
+            fb.round_rect(x, y, wv, h, 12.0 * s, pal.tint, (26.0 * rest * anim).clamp(0.0, 255.0) as u8);
+        }
     }
 
     // ── header: type badge + filename, hugging the top of the card ──
