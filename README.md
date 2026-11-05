@@ -60,6 +60,16 @@ better-desktop --help      # 快捷键速查
 | PPTX | **渲染第一页**：读 `slide1.xml` 的背景色、文本框位置与字号、以及图片，按 16:9 画出来；解析失败才退回文字页 |
 | 其他 | 系统缩略图（`IShellItemImageFactory`），空白缩略图会被丢弃 |
 
+## 一键生成卡片（最省事）
+
+齿轮菜单 → **加进文件右键菜单**，之后在资源管理器里**右键任意文件 → 添加到 better desktop**，卡片立刻出现在桌面上（已在运行的实例会直接接收，不需要重启）。
+
+也可以：
+- 把文件拖到 exe 图标上
+- 命令行传路径：`better-desktop.exe "D:\some\file.pdf"`（已运行时会转发给现有实例）
+
+移除入口：齿轮菜单里再点一次，或 `better-desktop.exe --uninstall-menu`。
+
 ## 多显示器
 
 - 工作区、边距、卡片尺寸都按**各自显示器**的 DPI 计算（`GetDpiForMonitor`），150% 与 100% 并排时观感一致

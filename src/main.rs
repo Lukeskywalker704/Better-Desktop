@@ -11,6 +11,7 @@ use std::{
 };
 use winapi::{
     shared::minwindef::{BOOL, LPARAM, LRESULT, WPARAM},
+    shared::minwindef::HKEY,
     shared::windef::{HBITMAP, HDC, HGDIOBJ, HICON, HMONITOR, HWND, POINT, RECT, SIZE},
     um::{
         errhandlingapi::GetLastError,
@@ -22,19 +23,21 @@ use winapi::{
             DeleteObject, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER,
             BI_RGB, DIB_RGB_COLORS, SRCCOPY,
         },
+        winnt::{KEY_WRITE, REG_SZ},
+        winreg::{RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_CURRENT_USER},
         winuser::{
             AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
             CloseClipboard, DestroyMenu, DrawTextW, EnumDisplayMonitors, FindWindowW, GetClassNameW,
             GetClipboardData, GetCursorPos, GetForegroundWindow, GetMonitorInfoW, keybd_event,
             MessageBoxW, OpenClipboard, RegisterHotKey,
-            GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, LoadImageW, MonitorFromPoint,
+            GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, LoadImageW, MonitorFromPoint, SendMessageW,
             MONITORINFO, PostMessageW,
             PrintWindow, RegisterClassW,
             ReleaseDC, ReleaseCapture, SetCapture, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, TrackPopupMenu,
             UpdateLayeredWindow, GWL_EXSTYLE, GWLP_WNDPROC, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON,
             LR_DEFAULTSIZE, LR_SHARED, MAKEINTRESOURCEW,
             SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-            CF_HDROP, HWND_BOTTOM, HWND_TOPMOST, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+            COPYDATASTRUCT, CF_HDROP, HWND_BOTTOM, HWND_TOPMOST, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, VK_CONTROL,
             TPM_RETURNCMD, WM_CLOSE, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
             WS_EX_NOACTIVATE,
@@ -3238,6 +3241,26 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         // WM_DISPLAYCHANGE: monitors came or went
         DISPLAY_CHANGED.store(true, Ordering::Relaxed);
     }
+    if msg == 0x004A && wp == 0 {
+        // WM_COPYDATA from a second instance: paths to turn into cards
+        let cds = unsafe { &*(lp as *const COPYDATASTRUCT) };
+        if std::env::var("BD_ARGS_DEBUG").is_ok() {
+            eprintln!("copy_data: dwData={} cbData={} lp={:?}", cds.dwData, cds.cbData, cds.lpData);
+        }
+        if cds.dwData == 0x4244 && !cds.lpData.is_null() && cds.cbData > 0 {
+            let count = (cds.cbData as usize) / 2;
+            let raw = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, count) };
+            let text = String::from_utf16_lossy(raw);
+            let mut list = PENDING_PATHS.lock().unwrap();
+            for part in text.split('\0') {
+                if !part.trim().is_empty() {
+                    list.push(part.to_string());
+                }
+            }
+            PENDING_PATHS_CHANGED.store(true, Ordering::Relaxed);
+        }
+        return 1; // TRUE
+    }
     if msg == 0x0312 {
         // WM_HOTKEY: id 1 adds cards, id 2 folds/unfolds everything
         match wp {
@@ -3300,8 +3323,10 @@ fn show_gear_menu(window: &Window, x: i32, y: i32, topmost: bool) -> Option<u32>
         AppendMenuW(menu, 0, 5, wide("全部展开  Ctrl+Alt+H").as_ptr());
         AppendMenuW(menu, 0, 6, wide("整理成右侧一列  Ctrl+Alt+T").as_ptr());
         AppendMenuW(menu, 0x00000800, 0, std::ptr::null());
-        AppendMenuW(menu, 0, 7, wide("打开配置文件夹").as_ptr());
-        AppendMenuW(menu, 0, 8, wide("退出").as_ptr());
+        let menu_label = if shell_menu_installed() { "移出文件右键菜单" } else { "加进文件右键菜单（一键生成卡片）" };
+        AppendMenuW(menu, 0, 7, wide(menu_label).as_ptr());
+        AppendMenuW(menu, 0, 8, wide("打开配置文件夹").as_ptr());
+        AppendMenuW(menu, 0, 9, wide("退出").as_ptr());
         let hwnd = get_hwnd(window);
         SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | 0x0002, x, y, 0, hwnd, std::ptr::null());
@@ -3321,6 +3346,22 @@ static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 
 extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == 0x004A && wp == 0 {
+        let cds = unsafe { &*(lp as *const COPYDATASTRUCT) };
+        if cds.dwData == 0x4244 && !cds.lpData.is_null() && cds.cbData > 0 {
+            let count = (cds.cbData as usize) / 2;
+            let raw = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, count) };
+            let text = String::from_utf16_lossy(raw);
+            let mut list = PENDING_PATHS.lock().unwrap();
+            for part in text.split('\0') {
+                if !part.trim().is_empty() {
+                    list.push(part.to_string());
+                }
+            }
+            PENDING_PATHS_CHANGED.store(true, Ordering::Relaxed);
+        }
+        return 1;
+    }
     unsafe {
         // WM_LBUTTONUP / WM_RBUTTONUP on the tray icon
         if msg == TRAY_CALLBACK && (lp as u32 == 0x0202 || lp as u32 == 0x0205) {
@@ -3674,7 +3715,145 @@ fn dump_bmp(path: PathBuf, fb: &Framebuffer) {
     }
 }
 
+/// Paths handed to us on the command line (shell menu / SendTo / drag onto
+/// the exe). They are queued and turned into cards once the overlay is up.
+static PENDING_PATHS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static PENDING_PATHS_CHANGED: AtomicBool = AtomicBool::new(false);
+
+const REG_KEY: &str = r"Software\Classes\*\shell\BetterDesktop";
+
+fn shell_menu_installed() -> bool {
+    std::process::Command::new("reg")
+        .args(["query", &format!("HKCU\\{REG_KEY}"), "/ve"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Write one REG_SZ value (or clear the key) under HKCU. Uses the registry API
+/// directly: shelling out to reg.exe mangles the non-ASCII menu caption.
+fn reg_set(key: &str, name: Option<&str>, value: &str) -> bool {
+    unsafe {
+        let sub = wide(key);
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let rc = RegCreateKeyExW(
+            HKEY_CURRENT_USER, sub.as_ptr(), 0, std::ptr::null_mut(), 0,
+            KEY_WRITE, std::ptr::null_mut(), &mut hkey, std::ptr::null_mut(),
+        );
+        if rc != 0 { return false; }
+        let data = wide(value);
+        let bytes = (data.len() * 2) as u32;
+        let name_wide = name.map(wide);
+        let name_ptr = name_wide.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null());
+        let rc2 = RegSetValueExW(
+            hkey, name_ptr, 0, REG_SZ,
+            data.as_ptr() as *const u8, bytes,
+        );
+        RegCloseKey(hkey);
+        rc2 == 0
+    }
+}
+
+fn reg_delete_tree(key: &str) -> bool {
+    unsafe {
+        let sub = wide(key);
+        RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr()) == 0
+    }
+}
+
+/// Register (or remove) the Explorer context-menu entry that turns a file into
+/// a card with one right click.
+fn set_shell_menu(install: bool) -> bool {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe_s = exe.to_string_lossy().to_string();
+    if !install {
+        return reg_delete_tree(REG_KEY);
+    }
+    let label = reg_set(&format!("{REG_KEY}"), None, "添加到 better desktop");
+    let icon = reg_set(&format!("{REG_KEY}"), Some("Icon"), &exe_s);
+    let command = reg_set(&format!("{REG_KEY}\\command"), None, &format!("\"{exe_s}\" \"%1\""));
+    label && icon && command
+}
+
+/// Ask the instance that is already running to add these paths, then exit.
+fn forward_to_running(paths: &[String]) -> bool {
+    unsafe {
+        let class = wide("BetterDesktopTrayWnd");
+        let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
+        if std::env::var("BD_ARGS_DEBUG").is_ok() {
+            eprintln!("forward: {} paths, hwnd={:?}", paths.len(), hwnd);
+        }
+        if hwnd.is_null() {
+            return false;
+        }
+        let joined = paths.join("\0") + "\0";
+        let mut utf16: Vec<u16> = joined.encode_utf16().collect();
+        let cds = COPYDATASTRUCT {
+            dwData: 0x4244, // "BD"
+            cbData: (utf16.len() * 2) as u32,
+            lpData: utf16.as_mut_ptr() as *mut _,
+        };
+        SendMessageW(hwnd, 0x004A, 0, &cds as *const _ as isize);
+    }
+    true
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // every command-line mode answers before the single-instance guard, so the
+    // utility switches work while the overlay is already running
+    if args.iter().any(|a| a == "--install-menu") {
+        let ok = set_shell_menu(true);
+        info_box(if ok {
+            "已加入右键菜单：在资源管理器里右键任意文件 → 添加到 better desktop\n（右键 → 发送到 → better desktop 也可以）"
+        } else {
+            "安装失败：写注册表被拒绝"
+        });
+        return;
+    }
+    if args.iter().any(|a| a == "--uninstall-menu") {
+        let _ = set_shell_menu(false);
+        info_box("已移出文件右键菜单");
+        return;
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V" || a == "-v") {
+        info_box(&format!(
+            "better desktop {}\n\nhttps://github.com/Lukeskywalker704/Better-Desktop",
+            env!("CARGO_PKG_VERSION")
+        ));
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        info_box("better desktop — Windows 桌面卡片\n\n\
+单击纸面：打开文件\n\
+拖动卡片 / 页眉：移动（Alt 关闭吸附）\n\
+拖四边或四角：独立调整宽高\n\
+滚轮：缩放；右侧滑动槽内滚轮：滚动整列\n\
+双击页眉 / 右上箭头：折叠 ↔ 展开\n\
+右键任意文件 → 添加到 better desktop（需先在齿轮菜单里开启）\n\n\
+Ctrl+Alt+D  添加卡片（剪贴板 / 资源管理器选中）\n\
+Ctrl+Alt+H  全部折叠 ↔ 全部展开\n\
+Ctrl+Alt+T  整理成右侧一列\n\n\
+配置：%APPDATA%\\BetterDesktop");
+        return;
+    }
+
+    // files passed on the command line: from the Explorer context menu, a SendTo
+    // shortcut, or files dropped onto the exe. A running instance takes them and
+    // this process just exits.
+    let argv_paths: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-') && FsPath::new(a.trim_matches('"')).exists())
+        .map(|a| a.trim_matches('"').to_string())
+        .collect();
+    if !argv_paths.is_empty() {
+        if forward_to_running(&argv_paths) {
+            return;
+        }
+        PENDING_PATHS.lock().unwrap().extend(argv_paths.iter().cloned());
+        PENDING_PATHS_CHANGED.store(true, Ordering::Relaxed);
+    }
+
     // one overlay per desktop: two instances would fight over the config file
     if std::env::var("BD_PROBE").is_err() && std::env::var("BD_BENCH").is_err() && std::env::var("BD_SNAP").is_err()
         && std::env::var("BD_BACKDROP").is_err() && std::env::var("BD_DPI").is_err()
@@ -3704,31 +3883,6 @@ fn main() {
     UI_SCALE_MILLI.store(((dpi as f32 / 96.0) * 1000.0) as u32, Ordering::Relaxed);
 
     migrate_legacy_config();
-    // version / help: a released exe is a GUI program, so answer in a dialog
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--version" || a == "-V" || a == "-v") {
-        info_box(&format!(
-            "better desktop {}\n\nhttps://github.com/Lukeskywalker704/Better-Desktop",
-            env!("CARGO_PKG_VERSION")
-        ));
-        return;
-    }
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        info_box("better desktop — Windows 桌面卡片\n\n\
-单击纸面：打开文件\n\
-拖动卡片 / 页眉：移动（Alt 关闭吸附）\n\
-拖四边或四角：独立调整宽高\n\
-滚轮：缩放；右侧滑动槽内滚轮：滚动整列\n\
-双击页眉 / 右上箭头：折叠 ↔ 展开\n\
-右键卡片：打开 / 折叠 / 刷新 / 移除\n\
-拖文件到卡片或 + 上：生成卡片\n\n\
-Ctrl+Alt+D  添加卡片（剪贴板 / 资源管理器选中）\n\
-Ctrl+Alt+H  全部折叠 ↔ 全部展开\n\
-Ctrl+Alt+T  整理成右侧一列\n\n\
-配置：%APPDATA%\\BetterDesktop");
-        return;
-    }
-
     let mut config = AppConfig::load();
 
     // virtual screen = union of all monitors, in physical pixels
@@ -4113,8 +4267,17 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                                     needs_save = true;
                                     window.request_redraw();
                                 }
-                                7 => { let _ = open::that(config_dir()); }
-                                8 => unsafe { PostMessageW(get_hwnd(&window), WM_CLOSE, 0, 0); },
+                                7 => {
+                                    let install = !shell_menu_installed();
+                                    let _ = set_shell_menu(install);
+                                    info_box(if install {
+                                        "已加入右键菜单：右键任意文件 → 添加到 better desktop"
+                                    } else {
+                                        "已移出文件右键菜单"
+                                    });
+                                }
+                                8 => { let _ = open::that(config_dir()); }
+                                9 => unsafe { PostMessageW(get_hwnd(&window), WM_CLOSE, 0, 0); },
                                 _ => {}
                             }
                         }
@@ -4417,6 +4580,20 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                     }
                     needs_save = true;
                     window.request_redraw();
+                }
+                if PENDING_PATHS_CHANGED.swap(false, Ordering::Relaxed) {
+                    let paths: Vec<String> = {
+                        let mut q = PENDING_PATHS.lock().unwrap();
+                        let v = q.clone();
+                        q.clear();
+                        v
+                    };
+                    if !paths.is_empty() {
+                        add_paths(paths, None, &mut config, &mut thumbs, &areas, &mut anims,
+                                  (vw as f32 * 0.45, vh as f32 * 0.35));
+                        needs_save = true;
+                        window.request_redraw();
+                    }
                 }
                 let fold_req = FOLD_REQUEST.swap(0, Ordering::Relaxed);
                 if fold_req != 0 {
