@@ -346,23 +346,6 @@ impl Framebuffer {
         }
     }
     /// Anti-aliased filled annulus (the settings gear's body).
-    fn ring(&mut self, cx: f32, cy: f32, r_out: f32, r_in: f32, c: (u8, u8, u8), a: u8) {
-        if a == 0 || r_out <= r_in { return; }
-        let x0 = (cx - r_out - 1.0).floor() as i32;
-        let y0 = (cy - r_out - 1.0).floor() as i32;
-        let x1 = (cx + r_out + 1.0).ceil() as i32;
-        let y1 = (cy + r_out + 1.0).ceil() as i32;
-        for py in y0..y1 {
-            for px in x0..x1 {
-                let d = (((px as f32 + 0.5) - cx).powi(2) + ((py as f32 + 0.5) - cy).powi(2)).sqrt();
-                let cov = ((r_out - d).min(d - r_in) + 0.5).clamp(0.0, 1.0);
-                if cov > 0.0 {
-                    let aa = (a as f32 * cov + 0.5) as u8;
-                    if aa > 0 { self.set_pixel(px, py, c.0, c.1, c.2, aa); }
-                }
-            }
-        }
-    }
     /// Fill a horizontal run with an opaque colour (straight copy, no blending).
     fn span_opaque(&mut self, x0: i32, x1: i32, y: i32, c: (u8, u8, u8)) {
         if y < 0 || y >= self.height as i32 { return; }
@@ -1976,8 +1959,36 @@ fn render_text_to_bitmap(text: &str, max_w: i32, size: i32, weight: i32, align: 
     tb
 }
 
+/// One frosted capsule holding both global actions: add on the left, menu on
+/// the right, split by a hairline like a macOS segmented control.
 #[derive(Clone, Copy)]
-struct Fab { center: (f32, f32), hover: bool }
+struct Toolbar { rect: (f32, f32, f32, f32), add_hover: bool, gear_hover: bool }
+
+impl Toolbar {
+    fn half(&self) -> (f32, f32, f32, f32) {
+        let (x, y, w, h) = self.rect;
+        (x, y, w * 0.5, h)
+    }
+
+    fn add_center(&self) -> (f32, f32) {
+        let (x, y, w, h) = self.half();
+        (x + w * 0.5, y + h * 0.5)
+    }
+
+    fn gear_center(&self) -> (f32, f32) {
+        let (x, y, _, h) = self.rect;
+        let (_, _, hw, _) = self.half();
+        (x + hw + hw * 0.5, y + h * 0.5)
+    }
+}
+
+/// Capsule geometry for the bottom-centre toolbar; the old round buttons sat at
+/// this optical centre, so the capsule keeps the same anchor.
+fn toolbar_at(fab_x: f32, fab_y: f32, k: f32, add_hover: bool, gear_hover: bool) -> Toolbar {
+    let h = 54.0 * k;
+    let w = 112.0 * k;
+    Toolbar { rect: (fab_x - w * 0.5, fab_y - h * 0.5, w, h), add_hover, gear_hover }
+}
 
 /// A card painted once into its own premultiplied buffer, so a frame is a
 /// handful of blits instead of millions of per-pixel blends. Shadows, the page
@@ -1988,7 +1999,7 @@ struct CardImage { w: i32, h: i32, px: Vec<u8>, body: (i32, i32, i32, i32) }
 
 type CardCache = HashMap<String, CardImage>;
 
-fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hover_idx: Option<usize>, lifted_idx: Option<usize>, thumbs: &HashMap<String, Thumbnail>, anims: &[(usize, std::time::Instant)], fab_add: Fab, fab_gear: Fab, drag_active: bool, guides: &[Guide], edge_hint: Option<(usize, u8)>) {
+fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hover_idx: Option<usize>, lifted_idx: Option<usize>, thumbs: &HashMap<String, Thumbnail>, anims: &[(usize, std::time::Instant)], toolbar: Toolbar, drag_active: bool, guides: &[Guide], edge_hint: Option<(usize, u8)>) {
     fb.clear();
     if drag_active {
         // alpha>=1 makes the whole window hit-testable, turning the entire
@@ -2017,8 +2028,7 @@ fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hov
             draw_resize_hint(fb, card, e, ui_scale());
         }
     }
-    draw_fab(fb, fab_add, 0);
-    draw_fab(fb, fab_gear, 1);
+    draw_toolbar(fb, toolbar);
 }
 
 /// Blend a premultiplied card bitmap onto the framebuffer at (x, y). Inside the
@@ -2137,48 +2147,48 @@ fn anim_progress(anims: &[(usize, std::time::Instant)], i: usize, now: std::time
     }
 }
 
-const FAB_R: f32 = 22.0;
-
 fn on_fab(center: (f32, f32), mx: f32, my: f32) -> bool {
-    let dx = mx - center.0;
-    let dy = my - center.1;
-    let r = FAB_R * ui_scale();
-    dx * dx + dy * dy <= r * r
+    // half a capsule cell, so the two targets meet at the divider
+    let half = 28.0 * ui_scale();
+    (mx - center.0).abs() <= half && (my - center.1).abs() <= half
 }
 
-/// Round floating action puck: `glyph` 0 = plus, 1 = settings gear.
-fn draw_fab(fb: &mut Framebuffer, fab: Fab, glyph: u8) {
-    let (cx, cy) = fab.center;
+/// The frosted capsule itself: one rounded slab, a hairline, a divider between
+/// the two hit areas and the two glyphs.
+fn draw_toolbar(fb: &mut Framebuffer, tb: Toolbar) {
     let k = ui_scale();
-    let r = FAB_R * k;
-    let d = r * 2.0;
-    // soft shadow, tighter when hovered
-    fb.round_rect(cx - r - 3.0 * k, cy - r + 2.0 * k, d + 6.0 * k, d + 6.0 * k, r + 3.0 * k, (46, 58, 82), 14);
-    fb.round_rect(cx - r - k, cy - r + k, d + 2.0 * k, d + 2.0 * k, r + k, (46, 58, 82), if fab.hover { 26 } else { 20 });
-    let body = if fab.hover { 255 } else { 243 };
-    fb.round_rect(cx - r, cy - r, d, d, r, (255, 255, 255), body);
-    fb.round_rect_stroke(cx - r + 0.5, cy - r + 0.5, d - 1.0, d - 1.0, r, 1.0, (28, 38, 58), 26);
-    let ink = if fab.hover { (46, 52, 64) } else { (96, 103, 116) };
-    if glyph == 0 {
-        let (arm, thick) = (8.5 * k, 1.25 * k);
-        fb.round_rect(cx - arm, cy - thick, arm * 2.0, thick * 2.0, thick, ink, 255);
-        fb.round_rect(cx - thick, cy - arm, thick * 2.0, arm * 2.0, thick, ink, 255);
-    } else {
-        draw_gear(fb, cx, cy, 8.4 * k, ink);
+    let (x, y, w, h) = tb.rect;
+    let rad = h * 0.5;
+    // a soft shadow instead of the old stacked rings
+    fb.soft_rect(x, y + 2.0 * k, w, h, rad, 14.0 * k, (0, 0, 0), 40.0);
+    // frosted body: near-opaque white with a lighter upper half
+    fb.round_rect(x, y, w, h, rad, (255, 255, 255), 240);
+    fb.round_rect(x, y, w, h * 0.55, rad, (255, 255, 255), 40);
+    fb.round_rect_stroke(x + 0.5, y + 0.5, w - 1.0, h - 1.0, rad, 1.0, (28, 38, 58), 30);
+    // the hovered half gets a subtle well, like a pressed segment
+    let inset = 4.0 * k;
+    if tb.add_hover {
+        fb.round_rect(x + inset, y + inset, w * 0.5 - inset * 2.0, h - inset * 2.0, rad - inset, (28, 38, 58), 18);
+    }
+    if tb.gear_hover {
+        fb.round_rect(x + w * 0.5 + inset, y + inset, w * 0.5 - inset * 2.0, h - inset * 2.0, rad - inset, (28, 38, 58), 18);
+    }
+    fb.round_rect(x + w * 0.5 - 0.5, y + h * 0.26, 1.0, h * 0.48, 0.5, (28, 38, 58), 26);
+    let ink = |hover: bool| if hover { (32, 36, 44) } else { (86, 92, 104) };
+    // plus
+    let (ax, ay) = tb.add_center();
+    let (arm, thick) = (8.0 * k, 1.2 * k);
+    fb.round_rect(ax - arm, ay - thick, arm * 2.0, thick * 2.0, thick, ink(tb.add_hover), 250);
+    fb.round_rect(ax - thick, ay - arm, thick * 2.0, arm * 2.0, thick, ink(tb.add_hover), 250);
+    // ellipsis
+    let (gx, gy) = tb.gear_center();
+    let dr = 1.9 * k;
+    for i in -1..=1 {
+        let cx = gx + i as f32 * 5.8 * k;
+        fb.round_rect(cx - dr, gy - dr, dr * 2.0, dr * 2.0, dr, ink(tb.gear_hover), 250);
     }
 }
 
-fn draw_gear(fb: &mut Framebuffer, cx: f32, cy: f32, r: f32, ink: (u8, u8, u8)) {
-    use std::f32::consts::PI;
-    let t = r * 0.25;
-    for i in 0..8 {
-        let a = i as f32 * PI / 4.0;
-        let tx = cx + a.cos() * (r + r * 0.12);
-        let ty = cy + a.sin() * (r + r * 0.12);
-        fb.round_rect(tx - t, ty - t, t * 2.0, t * 2.0, t * 0.45, ink, 255);
-    }
-    fb.ring(cx, cy, r + r * 0.15, r * 0.40, ink, 255);
-}
 
 const CARD_PAD: f32 = 15.0;
 /// shell thumbnails are fetched at this size (a card page is ~570px wide max)
@@ -4166,15 +4176,14 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
         let n: u32 = n.parse().unwrap_or(20).max(1);
         let mut bench_thumbs: HashMap<String, Thumbnail> = HashMap::new();
         generate_thumbnails(&config.cards, &mut bench_thumbs);
-        let add_fab = Fab { center: (w as f32 * 0.5 - 32.0, h as f32 - 118.0), hover: false };
-        let gear_fab = Fab { center: (w as f32 * 0.5 + 32.0, h as f32 - 118.0), hover: false };
+        let toolbar = toolbar_at(w as f32 * 0.5, h as f32 - 118.0, 1.0, false, false);
         let mut bench_cache: CardCache = CardCache::new();
         let t_cold = std::time::Instant::now();
-        render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], add_fab, gear_fab, false, &[], None);
+        render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], toolbar, false, &[], None);
         let cold = t_cold.elapsed().as_secs_f64() * 1000.0;
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], add_fab, gear_fab, false, &[], None);
+            render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], toolbar, false, &[], None);
         }
         eprintln!(
             "bench: {:.2} ms/frame, cold first frame {:.1} ms, {} cards",
@@ -4215,8 +4224,9 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
         .map(|a| ((a.x + a.w * 0.5) - vx as f32, (a.y + a.h) - vy as f32))
         .unwrap_or((vw as f32 * 0.5, vh as f32));
     let fab_y = fab_bottom - 96.0 * k;
-    let add_btn_center = (fab_x - 32.0 * k, fab_y);
-    let gear_btn_center = (fab_x + 32.0 * k, fab_y);
+    // hit targets come from the capsule itself, so they line up with the glyphs
+    let add_btn_center = toolbar_at(fab_x, fab_y, k, false, false).add_center();
+    let gear_btn_center = toolbar_at(fab_x, fab_y, k, false, false).gear_center();
     let mut add_btn_hover = false;
     let mut gear_btn_hover = false;
     let mut press_on_add = false;
@@ -4246,8 +4256,7 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                     let lifted = if is_dragging { press_idx } else { None };
                     render_cards(
                         &mut fb, &mut card_cache, &config.cards, hover_idx, lifted, &thumbs, &anims,
-                        Fab { center: add_btn_center, hover: add_btn_hover },
-                        Fab { center: gear_btn_center, hover: gear_btn_hover },
+                        toolbar_at(fab_x, fab_y, k, add_btn_hover, gear_btn_hover),
                         drag_active, &guides, edge_hint,
                     );
                     if config.rail {

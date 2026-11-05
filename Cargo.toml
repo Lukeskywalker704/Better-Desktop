@@ -1,6 +1,6 @@
 [package]
 name = "better-desktop"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "Windows desktop cards: put your files on the wallpaper as paper sheets, one click to open"
 license = "MIT"
