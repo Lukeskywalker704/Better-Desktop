@@ -88,6 +88,12 @@ better-desktop --help      # 快捷键速查
 
 ![深浅色](docs/theme-compare.png)
 
+## 快速预览（Quick Look 式）
+
+光标停在卡片上按 **Space**：桌面变暗、卡片放大成整页预览；再按 Space / Esc 或点一下任意位置关闭。托盘菜单里也有「预览光标下的卡片」，若系统的 Space 被别的程序占用可用这条。
+
+![预览](docs/preview-space.png)
+
 ## 动效
 
 入场和折叠都用解析解阻尼弹簧（response 0.42 s / damping 0.82），没有缓动表也没有过冲抖动；折叠时纸面高度与透明度一起过渡，胶囊在最后 40% 才淡入。

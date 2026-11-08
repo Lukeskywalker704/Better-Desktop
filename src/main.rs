@@ -29,7 +29,8 @@ use winapi::{
             AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
             CloseClipboard, DestroyMenu, DrawTextW, EnumDisplayMonitors, FindWindowW, GetClassNameW,
             GetClipboardData, GetCursorPos, GetForegroundWindow, GetMonitorInfoW, keybd_event,
-            DestroyIcon, GetIconInfo, MessageBoxW, OpenClipboard, RegisterHotKey,
+            CallNextHookEx, DestroyIcon, GetIconInfo, MessageBoxW, OpenClipboard, RegisterHotKey,
+            SetWindowsHookExW, WindowFromPoint,
             GetDC, GetSystemMetrics, GetWindowLongPtrW, LoadIconW, LoadImageW, MonitorFromPoint, SendMessageW,
             MONITORINFO, PostMessageW,
             PrintWindow, RegisterClassW,
@@ -2575,6 +2576,36 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
     paint_header(fb, card, x, y, s, hovered, anim, &style, light_bg);
 }
 
+/// Full-window preview sheet: dim the desktop, then draw the card large in the
+/// middle of the primary monitor (the same renderer, just a bigger card).
+fn draw_preview(
+    fb: &mut Framebuffer, card: &Card, thumbs: &HashMap<String, Thumbnail>, cache: &mut CardCache,
+    areas: &[WorkArea], age: f32,
+) {
+    let area = areas.iter().find(|a| a.primary).or_else(|| areas.first());
+    let Some(area) = area else { return };
+    let (aw, ah) = (area.w, area.h);
+    let open = spring(age, 0.32, 0.86).clamp(0.0, 1.0);
+    // dim the rest of the desktop so the sheet reads as a modal preview
+    fb.fill_rect(0, 0, fb.width as i32, fb.height as i32, 0, 0, 0, (110.0 * open) as u8);
+    let pw = (aw * 0.66).min(1180.0).max(360.0);
+    let ph = (ah * 0.84).max(240.0);
+    let grow = 0.94 + 0.06 * open;
+    let (pw, ph) = (pw * grow, ph * grow);
+    let x = area.x + (aw - pw) * 0.5;
+    let y = area.y + (ah - ph) * 0.5;
+    let mut big = card.clone();
+    let s = (pw / CARD_BASE_W).clamp(0.45, 2.4);
+    big.x = x;
+    big.y = y + 46.0 * s; // leave room for the caption row
+    big.width = pw;
+    big.height = (ph - (big.y - y)).max(80.0);
+    big.collapsed = false;
+    let guard = BACKDROP.lock().ok();
+    let bd = guard.as_ref().and_then(|g| g.as_ref());
+    draw_card(fb, cache, &big, false, false, open, thumbs.get(&card.path), bd, 1.0);
+}
+
 /// Small chevron; `dir` +1 points down (fold), -1 points up (unfold).
 fn draw_chevron(
     fb: &mut Framebuffer, cx: f32, cy: f32, half_w: f32, half_h: f32,
@@ -3663,6 +3694,45 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
     }
 }
 
+/// QuickLook-style preview: Space over a card opens the sheet large, Space or
+/// Esc closes it again.
+static PREVIEW_KEY: AtomicBool = AtomicBool::new(false);
+static PREVIEW_OPEN: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn space_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == 0 && (wparam == 0x0100 || wparam == 0x0104) {
+        let kb = &*(lparam as *const winapi::um::winuser::KBDLLHOOKSTRUCT);
+        let over_us = {
+            let mut pt: POINT = std::mem::zeroed();
+            GetCursorPos(&mut pt) != 0
+                && WindowFromPoint(pt) == MAIN_HWND.load(Ordering::Relaxed) as HWND
+        };
+        let open = PREVIEW_OPEN.load(Ordering::Relaxed);
+        if std::env::var("BD_HOOK_DEBUG").is_ok() { eprintln!("hook: vk={} over_us={} open={}", kb.vkCode, over_us, open); }
+        if kb.vkCode == 0x20 && (open || over_us) {
+            // swallow the space: it must not scroll whatever has focus
+            PREVIEW_KEY.store(true, Ordering::Relaxed);
+            return 1;
+        }
+        if kb.vkCode == 0x1B && open {
+            PREVIEW_KEY.store(true, Ordering::Relaxed);
+            return 1;
+        }
+    }
+    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+}
+
+fn install_space_hook() {
+    unsafe {
+        use winapi::um::libloaderapi::GetModuleHandleW;
+        let hook = SetWindowsHookExW(13, Some(space_hook), GetModuleHandleW(std::ptr::null()), 0);
+        if hook.is_null() {
+            // without the hook Space still works through the tray menu item
+            eprintln!("space hook failed: {}", GetLastError());
+        }
+    }
+}
+
 fn install_dpi_guard(hwnd: HWND) {
     unsafe {
         let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, main_wndproc as *const () as usize as isize);
@@ -3759,9 +3829,10 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             AppendMenuW(menu, 0x00000800, 0, std::ptr::null());
             AppendMenuW(menu, 0x00000000, 3, wide("全部折叠").as_ptr());
             AppendMenuW(menu, 0x00000000, 4, wide("全部展开").as_ptr());
+            AppendMenuW(menu, 0x00000000, 5, wide("预览光标下的卡片  Space").as_ptr());
             AppendMenuW(menu, 0x00000800, 0, std::ptr::null());
-            AppendMenuW(menu, 0x00000000, 5, wide("关于 Better Desktop").as_ptr());
-            AppendMenuW(menu, 0x00000000, 6, wide("退出 Better Desktop").as_ptr());
+            AppendMenuW(menu, 0x00000000, 6, wide("关于 Better Desktop").as_ptr());
+            AppendMenuW(menu, 0x00000000, 7, wide("退出 Better Desktop").as_ptr());
             let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | 0x0002, pt.x, pt.y, 0, hwnd, std::ptr::null());
             DestroyMenu(menu);
             match cmd {
@@ -3769,11 +3840,12 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 2 => REFRESH_REQUESTED.store(true, Ordering::Relaxed),
                 3 => FOLD_REQUEST.store(1, Ordering::Relaxed),
                 4 => FOLD_REQUEST.store(-1, Ordering::Relaxed),
-                5 => info_box(&format!(
+                5 => PREVIEW_KEY.store(true, Ordering::Relaxed),
+                6 => info_box(&format!(
                     "better desktop {}\n\nWindows 桌面卡片\nhttps://github.com/Lukeskywalker704/Better-Desktop",
                     env!("CARGO_PKG_VERSION")
                 )),
-                6 => { PostMessageW(MAIN_HWND.load(Ordering::Relaxed) as HWND, WM_CLOSE, 0, 0); }
+                7 => { PostMessageW(MAIN_HWND.load(Ordering::Relaxed) as HWND, WM_CLOSE, 0, 0); }
                 _ => {}
             }
             return 0;
@@ -4323,6 +4395,7 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
 
     // swallow WM_DPICHANGED before any move/resize so winit can't clamp us
     install_dpi_guard(get_hwnd(&window));
+    install_space_hook();
     // layered window: per-pixel alpha => transparent regions are click-through
     install_layered_style(get_hwnd(&window));
     apply_zorder(get_hwnd(&window), config.topmost);
@@ -4457,6 +4530,13 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     // hold Alt to place a card by hand without any snapping
     let mut alt_down = false;
     let mut hover_idx: Option<usize> = None;
+    // QuickLook preview: which card is enlarged, and when it opened
+    let mut preview: Option<(usize, std::time::Instant)> = std::env::var("BD_PREVIEW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|i| *i < config.cards.len())
+        // render checks open the preview immediately, fully sprung open
+        .map(|i| (i, std::time::Instant::now() - std::time::Duration::from_secs(2)));
     let mut needs_save = false;
     let mut cursor_pos = (0.0f32, 0.0f32);
     let mut thumbs: HashMap<String, Thumbnail> = HashMap::new();
@@ -4510,6 +4590,14 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                     if config.rail {
                         draw_rail(&mut fb, &config.cards, &areas, ui_scale());
                     }
+                    if let Some((idx, at)) = preview {
+                        if let Some(card) = config.cards.get(idx) {
+                            draw_preview(
+                                &mut fb, card, &thumbs, &mut card_cache, &areas,
+                                at.elapsed().as_secs_f32(),
+                            );
+                        }
+                    }
                     presenter.present(get_hwnd(&window), (vx, vy), &fb);
                 }
                 WindowEvent::ModifiersChanged(mods) => {
@@ -4529,6 +4617,13 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                 }
                 WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                     let (mx, my) = cursor_pos;
+                    if preview.is_some() {
+                        // click anywhere to dismiss, like Quick Look
+                        preview = None;
+                        PREVIEW_OPEN.store(false, Ordering::Relaxed);
+                        window.request_redraw();
+                        return;
+                    }
                     if on_fab(add_btn_center, mx, my) {
                         press_on_add = true;
                     } else if on_fab(gear_btn_center, mx, my) {
@@ -4984,6 +5079,15 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                         needs_save = true;
                         window.request_redraw();
                     }
+                }
+                if PREVIEW_KEY.swap(false, Ordering::Relaxed) {
+                    preview = match preview {
+                        Some(_) => None,
+                        None => card_at(&config.cards, cursor_pos.0, cursor_pos.1)
+                            .map(|i| (i, std::time::Instant::now())),
+                    };
+                    PREVIEW_OPEN.store(preview.is_some(), Ordering::Relaxed);
+                    window.request_redraw();
                 }
                 sync_fold_anims(&mut fold_anims, &config.cards, std::time::Instant::now());
                 if !fold_anims.is_empty() {
