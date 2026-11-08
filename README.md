@@ -94,6 +94,10 @@ better-desktop --help      # 快捷键速查
 
 ![预览](docs/preview-space.png)
 
+翻页：预览里滚动滚轮，或按 `↑ ↓ ← →` / `PageUp` `PageDown`；右上角显示 `当前页 / 总页数`（PDF 用 Windows PDF 引擎逐页栅格化，PPTX 按幻灯片编号取页）。
+
+![翻页](docs/preview-pages.png)
+
 ## 动效
 
 入场和折叠都用解析解阻尼弹簧（response 0.42 s / damping 0.82），没有缓动表也没有过冲抖动；折叠时纸面高度与透明度一起过渡，胶囊在最后 40% 才淡入。

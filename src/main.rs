@@ -837,9 +837,26 @@ fn shell_thumbnail(path: &str, target: u32) -> Option<Thumbnail> {
     }
 }
 
-/// Rasterise page 1 of a PDF through the Windows PDF engine: most machines ship
-/// no shell thumbnail provider for PDFs, but they do have Windows.Data.Pdf.
-fn pdf_first_page(path: &str, target_w: u32) -> Option<Thumbnail> {
+/// Number of pages in a PDF, through the same Windows PDF engine.
+fn pdf_page_count(path: &str) -> usize {
+    use windows::core::HSTRING;
+    use windows::Data::Pdf::PdfDocument;
+    use windows::Storage::StorageFile;
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
+        let Ok(file) = StorageFile::GetFileFromPathAsync(&HSTRING::from(path)).ok().unwrap().get()
+        else { return 0 };
+        let Ok(doc) = PdfDocument::LoadFromFileAsync(&file).ok().unwrap().get() else { return 0 };
+        doc.PageCount().unwrap_or(0) as usize
+    }
+}
+
+/// Rasterise one page of a PDF through the Windows PDF engine: most machines
+/// ship no shell thumbnail provider for PDFs, but they do have Windows.Data.Pdf.
+fn pdf_page_raster(path: &str, page: u32, target_w: u32) -> Option<Thumbnail> {
     use windows::core::HSTRING;
     use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
     use windows::Storage::StorageFile;
@@ -853,7 +870,7 @@ fn pdf_first_page(path: &str, target_w: u32) -> Option<Thumbnail> {
         let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path)).ok()?.get().ok()?;
         let doc = PdfDocument::LoadFromFileAsync(&file).ok()?.get().ok()?;
         if doc.PageCount().ok()? == 0 { return None; }
-        let page = doc.GetPage(0).ok()?;
+        let page = doc.GetPage(page).ok()?;
         let stream = InMemoryRandomAccessStream::new().ok()?;
         let options = PdfPageRenderOptions::new().ok()?;
         options.SetDestinationWidth(target_w).ok()?;
@@ -911,7 +928,7 @@ fn file_preview(path: &str, target: u32) -> Option<Thumbnail> {
     if ext == "PDF" {
         // only pay for a page render when there is no text layer to show
         if pdf_text(path).is_empty() {
-            return pdf_first_page(path, target);
+            return pdf_page_raster(path, 0, target);
         }
     }
     if ext == "PPTX" || ext == "PPTM" || ext == "POTX" {
@@ -1825,6 +1842,29 @@ fn extract_blocks(path: &str) -> Vec<Block> {
     }
 }
 
+/// Page count for the preview: PDFs report real pages, decks report slides,
+/// everything else is a single page.
+fn page_count_of(path: &str) -> usize {
+    let ext = FsPath::new(path).extension().unwrap_or_default().to_string_lossy().to_uppercase();
+    match ext.as_str() {
+        "PDF" => pdf_page_count(path).max(1),
+        "PPTX" | "PPTM" | "POTX" => {
+            let Ok(file) = fs::File::open(path) else { return 1 };
+            let Ok(zip) = zip::ZipArchive::new(file) else { return 1 };
+            let n = zip
+                .file_names()
+                .filter(|n| {
+                    n.as_ref()
+                        .map(|s| s.starts_with("ppt/slides/slide") && s.ends_with(".xml"))
+                        .unwrap_or(false)
+                })
+                .count();
+            n.max(1)
+        }
+        _ => 1,
+    }
+}
+
 /// All the text of a parsed document, for quality checks.
 fn blocks_text(blocks: &[Block]) -> String {
     let mut out = String::new();
@@ -1879,21 +1919,21 @@ fn text_garbled(text: &str) -> bool {
     short * 100 / words.len() >= 45
 }
 
-/// Rasterised first page of a PDF, cached per path and modification time.
-fn pdf_page_image(path: &str) -> Option<Thumbnail> {
+/// Rasterised page of a PDF, cached per path, page and modification time.
+fn pdf_page_image(path: &str, page: usize) -> Option<Thumbnail> {
     static CACHE: Mutex<Option<HashMap<String, Option<Thumbnail>>>> = Mutex::new(None);
     let stamp = fs::metadata(path)
         .ok()
         .map(|m| m.len())
         .unwrap_or(0);
-    let key = format!("{path}|{stamp}");
+    let key = format!("{path}|{page}|{stamp}");
     if let Ok(mut guard) = CACHE.lock() {
         let cache = guard.get_or_insert_with(HashMap::new);
         if let Some(hit) = cache.get(&key) {
             return hit.clone();
         }
     }
-    let page = pdf_first_page(path, 900);
+    let page = pdf_page_raster(path, page as u32, 1100);
     if let Ok(mut guard) = CACHE.lock() {
         let cache = guard.get_or_insert_with(HashMap::new);
         if cache.len() > 16 {
@@ -2097,13 +2137,13 @@ fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hov
         if lifted_idx == Some(i) { continue; }
         let anim = anim_progress(anims, i, now);
         let open = open_of(folds, &card.path, card.collapsed, now);
-        draw_card(fb, cache, card, hover_idx == Some(i), false, anim, thumbs.get(&card.path), backdrop, open);
+        draw_card(fb, cache, card, hover_idx == Some(i), false, anim, thumbs.get(&card.path), backdrop, open, 0);
     }
     // lifted card renders last so it floats above the others
     if let Some(i) = lifted_idx {
         if let Some(card) = cards.get(i) {
             let open = open_of(folds, &card.path, card.collapsed, now);
-            draw_card(fb, cache, card, hover_idx == Some(i), true, anim_progress(anims, i, now), thumbs.get(&card.path), backdrop, open);
+            draw_card(fb, cache, card, hover_idx == Some(i), true, anim_progress(anims, i, now), thumbs.get(&card.path), backdrop, open, 0);
         }
     }
     drop(guard);
@@ -2181,7 +2221,7 @@ fn thumb_sig(t: Option<&Thumbnail>) -> u64 {
     }
 }
 
-fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: bool, lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>, open: f32) {
+fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: bool, lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>, open: f32, page: usize) {
     if anim <= 0.02 { return; }
     let w = card.box_w();
     let s = (w / CARD_BASE_W).clamp(0.45, 2.4);
@@ -2196,14 +2236,14 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
 
     if anim < 0.999 || open < 0.999 {
         // transient animation: paint straight onto the frame, no cache
-        paint_card(fb, card, dx, dy, hovered, lifted, anim, thumb, backdrop, open);
+        paint_card(fb, card, dx, dy, hovered, lifted, anim, thumb, backdrop, open, page);
         return;
     }
 
     let pad = (30.0 * s).ceil() as i32;
     let key = format!(
-        "{}|{}x{}|{}{}|{}", card.path, w as i32, h as i32,
-        hovered as u8, lifted as u8, thumb_sig(thumb)
+        "{}|{}x{}|{}{}|{}|{}", card.path, w as i32, h as i32,
+        hovered as u8, lifted as u8, thumb_sig(thumb), page
     );
     if let Some(img) = cache.get(&key) {
         blit_card(fb, img, dx as i32 - pad, dy as i32 - pad, backdrop);
@@ -2212,7 +2252,7 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
     let bw = w as i32 + pad * 2;
     let bh = h as i32 + pad * 2;
     let mut scratch = Framebuffer::new(bw.max(1) as u32, bh.max(1) as u32);
-    paint_card(&mut scratch, card, pad as f32, pad as f32, hovered, lifted, 1.0, thumb, backdrop, open);
+    paint_card(&mut scratch, card, pad as f32, pad as f32, hovered, lifted, 1.0, thumb, backdrop, open, page);
     let img = CardImage {
         w: bw, h: bh, px: std::mem::take(&mut scratch.pixels),
         // the paper no longer has a translucent band, so nothing needs to be
@@ -2464,7 +2504,7 @@ fn paint_header(
 
 fn s0(card: &Card) -> f32 { (card.width / CARD_BASE_W).clamp(0.45, 2.4) }
 
-fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, _lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>, open: f32) {
+fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, _lifted: bool, anim: f32, thumb: Option<&Thumbnail>, backdrop: Option<&Backdrop>, open: f32, page: usize) {
     if anim <= 0.02 { return; }
     let style = type_style(&card.file_ext());
     // caption contrast follows the wallpaper under the card
@@ -2533,7 +2573,7 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
         // text approximation, so try that first
         let mut drew_slide = false;
         if is_slide {
-            if let Some(model) = slide_model(&card.path, 1) {
+            if let Some(model) = slide_model(&card.path, page as u32 + 1) {
                 draw_slide(fb, &model, px + band, py + band, pw - 2.0 * band, ph - 2.0 * band, 10.0 * s);
                 drew_slide = true;
             }
@@ -2541,7 +2581,7 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
         let slide = is_slide && !drew_slide;
         // a PDF whose text extraction is meaningless is shown as a real page
         let pdf_page = if ext == "PDF" && (blocks.is_empty() || text_garbled(&blocks_text(&blocks))) {
-            pdf_page_image(&card.path)
+            pdf_page_image(&card.path, page)
         } else {
             None
         };
@@ -2576,11 +2616,24 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
     paint_header(fb, card, x, y, s, hovered, anim, &style, light_bg);
 }
 
+/// Move the preview by `step` pages, clamped to the document.
+fn page_step(preview: Option<(usize, std::time::Instant, usize)>, step: i32) -> Option<(usize, std::time::Instant, usize)> {
+    let (idx, at, page) = preview?;
+    Some((idx, at, page.saturating_add_signed(step as isize)))
+}
+
+/// Clamp a requested page against the real page count.
+fn clamp_page(cards: &[Card], preview: (usize, std::time::Instant, usize)) -> (usize, std::time::Instant, usize) {
+    let (idx, at, page) = preview;
+    let total = cards.get(idx).map(|c| page_count_of(&c.path)).unwrap_or(1).max(1);
+    (idx, at, page.min(total - 1))
+}
+
 /// Full-window preview sheet: dim the desktop, then draw the card large in the
 /// middle of the primary monitor (the same renderer, just a bigger card).
 fn draw_preview(
     fb: &mut Framebuffer, card: &Card, thumbs: &HashMap<String, Thumbnail>, cache: &mut CardCache,
-    areas: &[WorkArea], age: f32,
+    areas: &[WorkArea], age: f32, page: usize,
 ) {
     let area = areas.iter().find(|a| a.primary).or_else(|| areas.first());
     let Some(area) = area else { return };
@@ -2603,7 +2656,18 @@ fn draw_preview(
     big.collapsed = false;
     let guard = BACKDROP.lock().ok();
     let bd = guard.as_ref().and_then(|g| g.as_ref());
-    draw_card(fb, cache, &big, false, false, open, thumbs.get(&card.path), bd, 1.0);
+    draw_card(fb, cache, &big, false, false, open, thumbs.get(&card.path), bd, 1.0, page);
+    // page indicator: n / total, only for paged documents
+    let total = page_count_of(&card.path);
+    if total > 1 {
+        let label = format!("{} / {}", page + 1, total);
+        let pal = palette();
+        let fs = (16.0 * s).round() as i32;
+        let w = (label.chars().count() as f32 * 9.0 * s + 20.0 * s) as i32;
+        let (bx, by) = ((x + pw - w as f32 - 12.0 * s), (y + 6.0 * s));
+        fb.round_rect(bx, by, w as f32, fs as f32 + 12.0 * s, 10.0 * s, pal.panel, 210);
+        draw_text(fb, &label, bx as i32 + 10, by as i32 + 6, w - 16, fs, 600, pal.ink2, 0);
+    }
 }
 
 /// Small chevron; `dir` +1 points down (fold), -1 points up (unfold).
@@ -3698,6 +3762,8 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
 /// Esc closes it again.
 static PREVIEW_KEY: AtomicBool = AtomicBool::new(false);
 static PREVIEW_OPEN: AtomicBool = AtomicBool::new(false);
+/// Pending page step from the keyboard (+1 next, -1 previous).
+static PAGE_STEP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 unsafe extern "system" fn space_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == 0 && (wparam == 0x0100 || wparam == 0x0104) {
@@ -3717,6 +3783,16 @@ unsafe extern "system" fn space_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         if kb.vkCode == 0x1B && open {
             PREVIEW_KEY.store(true, Ordering::Relaxed);
             return 1;
+        }
+        if open {
+            if let Some(step) = match kb.vkCode {
+                0x28 | 0x22 | 0x27 => Some(1),  // Down / PageDown / Right
+                0x26 | 0x21 | 0x25 => Some(-1), // Up / PageUp / Left
+                _ => None,
+            } {
+                PAGE_STEP.store(step, Ordering::Relaxed);
+                return 1;
+            }
         }
     }
     CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
@@ -4531,12 +4607,16 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     let mut alt_down = false;
     let mut hover_idx: Option<usize> = None;
     // QuickLook preview: which card is enlarged, and when it opened
-    let mut preview: Option<(usize, std::time::Instant)> = std::env::var("BD_PREVIEW")
+    // (card index, opened at, page)
+    let mut preview: Option<(usize, std::time::Instant, usize)> = std::env::var("BD_PREVIEW")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|i| *i < config.cards.len())
         // render checks open the preview immediately, fully sprung open
-        .map(|i| (i, std::time::Instant::now() - std::time::Duration::from_secs(2)));
+        .map(|i| {
+            let page = std::env::var("BD_PAGE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            (i, std::time::Instant::now() - std::time::Duration::from_secs(2), page)
+        });
     let mut needs_save = false;
     let mut cursor_pos = (0.0f32, 0.0f32);
     let mut thumbs: HashMap<String, Thumbnail> = HashMap::new();
@@ -4590,11 +4670,11 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                     if config.rail {
                         draw_rail(&mut fb, &config.cards, &areas, ui_scale());
                     }
-                    if let Some((idx, at)) = preview {
+                    if let Some((idx, at, page)) = preview {
                         if let Some(card) = config.cards.get(idx) {
                             draw_preview(
                                 &mut fb, card, &thumbs, &mut card_cache, &areas,
-                                at.elapsed().as_secs_f32(),
+                                at.elapsed().as_secs_f32(), page,
                             );
                         }
                     }
@@ -4972,6 +5052,21 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                     }
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
+                    if preview.is_some() {
+                        // wheel pages through the preview
+                        let step = match delta {
+                            winit::event::MouseScrollDelta::LineDelta(_, y) => y.signum() as i32,
+                            winit::event::MouseScrollDelta::PixelDelta(p) => {
+                                (p.y / 120.0).signum() as i32
+                            }
+                        };
+                        if step != 0 {
+                            preview = page_step(preview, step)
+                                .map(|p| clamp_page(&config.cards, p));
+                            window.request_redraw();
+                        }
+                        return;
+                    }
                     if is_dragging { return; }
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
@@ -5080,12 +5175,18 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                         window.request_redraw();
                     }
                 }
+                let step = PAGE_STEP.swap(0, Ordering::Relaxed);
+                if step != 0 && preview.is_some() {
+                    preview = page_step(preview, step).map(|p| clamp_page(&config.cards, p));
+                    window.request_redraw();
+                }
                 if PREVIEW_KEY.swap(false, Ordering::Relaxed) {
                     preview = match preview {
                         Some(_) => None,
                         None => card_at(&config.cards, cursor_pos.0, cursor_pos.1)
-                            .map(|i| (i, std::time::Instant::now())),
+                            .map(|i| (i, std::time::Instant::now(), 0)),
                     };
+                    preview = preview.and_then(|p| Some(clamp_page(&config.cards, p)));
                     PREVIEW_OPEN.store(preview.is_some(), Ordering::Relaxed);
                     window.request_redraw();
                 }

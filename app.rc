@@ -1,8 +1,8 @@
 1 ICON "icon.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,1,17,0
-PRODUCTVERSION 0,1,17,0
+FILEVERSION 0,1,18,0
+PRODUCTVERSION 0,1,18,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -11,9 +11,9 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "FileDescription", "better desktop"
-      VALUE "FileVersion", "0.1.17"
+      VALUE "FileVersion", "0.1.18"
       VALUE "ProductName", "better desktop"
-      VALUE "ProductVersion", "0.1.17"
+      VALUE "ProductVersion", "0.1.18"
       VALUE "OriginalFilename", "better-desktop.exe"
       VALUE "LegalCopyright", "MIT License"
     END
