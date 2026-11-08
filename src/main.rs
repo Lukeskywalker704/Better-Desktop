@@ -1824,6 +1824,85 @@ fn extract_blocks(path: &str) -> Vec<Block> {
     }
 }
 
+/// All the text of a parsed document, for quality checks.
+fn blocks_text(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        match b {
+            Block::Title(t) | Block::Heading(t) | Block::Para(t) | Block::Bullet(t) => {
+                out.push_str(t);
+                out.push(' ');
+            }
+            Block::Table(rows) => {
+                for row in rows {
+                    for cell in row {
+                        out.push_str(cell);
+                        out.push(' ');
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// PDFs whose fonts carry no usable `ToUnicode` come out as letter salad
+/// ("ni MER tn EN xn m in Mi"). Those pages are worth rasterising instead.
+fn text_garbled(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let total = chars.len();
+    if total < 24 {
+        return false;
+    }
+    let cjk = chars.iter().filter(|c| ('\u{4E00}'..='\u{9FFF}').contains(c)).count();
+    // real Chinese text: never treat it as damage
+    if cjk * 5 >= total {
+        return false;
+    }
+    let junk = chars
+        .iter()
+        .filter(|c| **c == '\u{FFFD}' || ('\u{E000}'..='\u{F8FF}').contains(c))
+        .count();
+    if junk * 20 >= total {
+        return true;
+    }
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .filter(|w| w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .collect();
+    if words.len() < 10 {
+        return false;
+    }
+    let short = words.iter().filter(|w| w.len() <= 2).count();
+    // CID-mangled text is a stream of one and two letter fragments
+    short * 100 / words.len() >= 45
+}
+
+/// Rasterised first page of a PDF, cached per path and modification time.
+fn pdf_page_image(path: &str) -> Option<Thumbnail> {
+    static CACHE: Mutex<Option<HashMap<String, Option<Thumbnail>>>> = Mutex::new(None);
+    let stamp = fs::metadata(path)
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let key = format!("{path}|{stamp}");
+    if let Ok(mut guard) = CACHE.lock() {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
+    }
+    let page = pdf_first_page(path, 900);
+    if let Ok(mut guard) = CACHE.lock() {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if cache.len() > 16 {
+            cache.clear();
+        }
+        cache.insert(key, page.clone());
+    }
+    page
+}
+
 /// Cached extraction: a card repaints on hover/zoom and the container is
 /// re-read only when the file changes size or mtime.
 fn doc_blocks(path: &str) -> Vec<Block> {
@@ -2459,12 +2538,30 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
             }
         }
         let slide = is_slide && !drew_slide;
+        // a PDF whose text extraction is meaningless is shown as a real page
+        let pdf_page = if ext == "PDF" && (blocks.is_empty() || text_garbled(&blocks_text(&blocks))) {
+            pdf_page_image(&card.path)
+        } else {
+            None
+        };
         if drew_slide {
             // the slide already painted the paper
         } else if slide && thumb.is_some() {
             let t = thumb.unwrap();
             draw_thumbnail(fb, t, (px + band) as i32, (py + band) as i32,
                            (pw - 2.0 * band) as i32, (ph - 2.0 * band) as i32);
+        } else if let Some(page) = pdf_page.as_ref() {
+            // a portrait page inside a landscape card: fit by height and centre
+            // it, so it reads as a page rather than a left-aligned stamp
+            let (aw, ah) = (pw - 2.0 * band, ph - 2.0 * band);
+            let k = (aw / page.width as f32).min(ah / page.height as f32);
+            let (iw, ih) = (page.width as f32 * k, page.height as f32 * k);
+            draw_thumbnail(
+                fb, page,
+                (px + band + (aw - iw) * 0.5) as i32,
+                (py + band + (ah - ih) * 0.5) as i32,
+                iw as i32, ih as i32,
+            );
         } else if !blocks.is_empty() {
             draw_doc_page(fb, &blocks, &style, px, py, pw, ph, s);
         } else if let Some(t) = thumb {
