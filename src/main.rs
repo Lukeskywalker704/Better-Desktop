@@ -63,6 +63,16 @@ const CARD_BASE_W: f32 = 380.0;
 /// height / width kept when a card is zoomed with the wheel
 const CARD_ASPECT: f32 = 1.45;
 
+/// Centralised document typography. Every size the doc page draws is derived
+/// from here, so the hierarchy stays consistent when a card is zoomed.
+struct TypeScale { title: f32, h1: f32, h2: f32, body: f32, caption: f32 }
+
+fn type_scale(s: f32) -> TypeScale {
+    // weights: title/h1/h2 = 700/600/600, body/caption = 400
+    // line heights: 1.35 / 1.40 / 1.55; post gaps: 7s / 5s / 4s / 5s
+    TypeScale { title: 17.0 * s, h1: 13.0 * s, h2: 11.5 * s, body: 10.5 * s, caption: 9.5 * s }
+}
+
 static UI_SCALE_MILLI: AtomicU32 = AtomicU32::new(1000);
 
 /// Window-DPI / 96, i.e. how many physical pixels one logical pixel is.
@@ -1088,7 +1098,8 @@ fn draw_thumbnail(fb: &mut Framebuffer, thumb: &Thumbnail, px: i32, py: i32, pw:
 #[derive(Clone, Debug)]
 enum Block {
     Title(String),
-    Heading(String),
+    /// outline level, 1 or 2 (deeper levels are clamped)
+    Heading(u8, String),
     Para(String),
     Bullet(String),
     Table(Vec<Vec<String>>),
@@ -1179,8 +1190,9 @@ fn docx_blocks(xml: &str) -> Vec<Block> {
             .unwrap_or("");
         let block = if style.starts_with("Title") {
             Block::Title(text)
-        } else if style.starts_with("Heading") {
-            Block::Heading(text)
+        } else if let Some(rest) = style.strip_prefix("Heading") {
+            let level = rest.trim().parse::<u8>().map(|n| n.clamp(1, 2)).unwrap_or(1);
+            Block::Heading(level.max(1), text)
         } else if style.contains("List") {
             Block::Bullet(text)
         } else if out.is_empty() {
@@ -1672,12 +1684,13 @@ fn md_blocks(lines: &[String]) -> Vec<Block> {
         let l = line.trim();
         if l.is_empty() { continue; }
         if let Some(rest) = l.strip_prefix('#') {
+            let level = (l.len() - rest.len()).clamp(1, 2) as u8;
             let title = rest.trim_start_matches('#').trim();
             if !title.is_empty() {
                 out.push(if out.is_empty() {
                     Block::Title(title.to_string())
                 } else {
-                    Block::Heading(title.to_string())
+                    Block::Heading(level, title.to_string())
                 });
             }
         } else if let Some(rest) = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")) {
@@ -1870,7 +1883,7 @@ fn blocks_text(blocks: &[Block]) -> String {
     let mut out = String::new();
     for b in blocks {
         match b {
-            Block::Title(t) | Block::Heading(t) | Block::Para(t) | Block::Bullet(t) => {
+            Block::Title(t) | Block::Heading(_, t) | Block::Para(t) | Block::Bullet(t) => {
                 out.push_str(t);
                 out.push(' ');
             }
@@ -1981,6 +1994,15 @@ const UI_FONT: &str = "Microsoft YaHei UI";
 static TEXT_CACHE: Mutex<Option<HashMap<TextKey, TextBitmap>>> = Mutex::new(None);
 
 
+/// GDI raster quality for every text render; BD_FONT_AA overrides (5 =
+/// ClearType, 4 = grayscale AA). A/B via BD_DUMP before changing the default.
+fn font_aa_quality() -> u32 {
+    static AA: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *AA.get_or_init(|| {
+        std::env::var("BD_FONT_AA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(4)
+    })
+}
+
 /// Real advance width of a caption, measured with the same GDI font the card
 /// draws with (the per-character estimate is only used for wrapping).
 fn measure_text(text: &str, size: i32, weight: i32) -> f32 {
@@ -1990,7 +2012,7 @@ fn measure_text(text: &str, size: i32, weight: i32) -> f32 {
         ReleaseDC(std::ptr::null_mut(), screen);
         if hdc.is_null() { return 0.0; }
         let face = wide("Microsoft YaHei UI");
-        let font = CreateFontW(-size, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+        let font = CreateFontW(-size, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, font_aa_quality(), 0, face.as_ptr());
         let old = SelectObject(hdc, font as HGDIOBJ);
         let wide_text: Vec<u16> = text.encode_utf16().collect();
         let mut extent = SIZE { cx: 0, cy: 0 };
@@ -2052,7 +2074,7 @@ fn render_text_to_bitmap(text: &str, max_w: i32, size: i32, weight: i32, align: 
         let old_bmp = SelectObject(hdc, dib as *mut _);
         let font = CreateFontW(
             -size, 0, 0, 0, weight, 0, 0, 0,
-            1, 0, 0, 5, 0, wide(UI_FONT).as_ptr(), // CLEARTYPE: its solid cores are what the alpha extraction needs
+            1, 0, 0, font_aa_quality(), 0, wide(UI_FONT).as_ptr(), // ClearType: its solid cores are what the alpha extraction needs
         );
         let old_font = SelectObject(hdc, font as *mut _);
         SetBkMode(hdc, 1); // TRANSPARENT
@@ -2242,8 +2264,8 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
 
     let pad = (30.0 * s).ceil() as i32;
     let key = format!(
-        "{}|{}x{}|{}{}|{}|{}", card.path, w as i32, h as i32,
-        hovered as u8, lifted as u8, thumb_sig(thumb), page
+        "{}|{}x{}|{}{}|{}|{}|{}", card.path, w as i32, h as i32,
+        hovered as u8, lifted as u8, thumb_sig(thumb), page, doc_mtime_secs(&card.path)
     );
     if let Some(img) = cache.get(&key) {
         blit_card(fb, img, dx as i32 - pad, dy as i32 - pad, backdrop);
@@ -2379,6 +2401,8 @@ struct Palette {
     paper: (u8, u8, u8),
     ink: (u8, u8, u8),
     ink2: (u8, u8, u8),
+    /// body copy sits between ink and ink2: readable, never shouty
+    body: (u8, u8, u8),
     rule: (u8, u8, u8),
     panel: (u8, u8, u8),
     glyph: (u8, u8, u8),
@@ -2395,6 +2419,7 @@ fn palette() -> Palette {
             paper: (28, 28, 30),      // #1C1C1E
             ink: (242, 242, 247),     // label
             ink2: (152, 152, 159),    // secondaryLabel
+            body: (216, 216, 220),    // body copy, brighter than secondary
             rule: (72, 72, 78),       // separator
             panel: (44, 44, 48),      // capsule / pill body
             glyph: (210, 210, 216),
@@ -2406,6 +2431,7 @@ fn palette() -> Palette {
             paper: (255, 255, 255),
             ink: (29, 29, 31),
             ink2: (110, 110, 118),
+            body: (60, 60, 66),
             rule: (228, 228, 232),
             panel: (255, 255, 255),
             glyph: (86, 92, 104),
@@ -2563,9 +2589,9 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
     if pw > 24.0 * s && ph > 24.0 * s {
         // two-layer drop shadow: a wide diffuse one and a tight contact one, the
         // way a sheet of paper reads on a desktop
-        fb.soft_rect(px, py + 8.0 * s, pw, ph, 14.0 * s, 24.0 * s, (0, 0, 0), 46.0 * anim);
-        fb.soft_rect(px, py + 1.0 * s, pw, ph, 14.0 * s, 3.0 * s, (0, 0, 0), 34.0 * anim);
-        fb.glass_paper(px, py, pw, ph, 14.0 * s, band, anim);
+        fb.soft_rect(px, py + 7.0 * s, pw, ph, 17.0 * s, 26.0 * s, (0, 0, 0), 40.0 * anim);
+        fb.soft_rect(px, py + 1.0 * s, pw, ph, 17.0 * s, 3.5 * s, (0, 0, 0), 30.0 * anim);
+        fb.glass_paper(px, py, pw, ph, 17.0 * s, band, anim);
         let blocks = doc_blocks(&card.path);
         let ext = card.file_ext();
         let is_slide = matches!(ext.as_str(), "PPTX" | "PPTM" | "POTX" | "PPT");
@@ -2605,6 +2631,7 @@ fn paint_card(fb: &mut Framebuffer, card: &Card, x: f32, y: f32, hovered: bool, 
             );
         } else if !blocks.is_empty() {
             draw_doc_page(fb, &blocks, &style, px, py, pw, ph, s);
+            draw_doc_footer(fb, card, px, py, pw, ph, s);
         } else if let Some(t) = thumb {
             // keep the glass edge clear of the image: the print sits inside it
             draw_thumbnail(fb, t, (px + band) as i32, (py + band) as i32,
@@ -2784,31 +2811,38 @@ fn wrap_lines(text: &str, size: f32, max_w: f32) -> Vec<String> {
 fn draw_doc_page(fb: &mut Framebuffer, blocks: &[Block], style: &TypeStyle, px: f32, py: f32, pw: f32, ph: f32, s: f32) {
     let ix = px + 15.0 * s;
     let iw = pw - 30.0 * s;
-    let bottom = py + ph - 10.0 * s;
+    let bottom = py + ph - 28.0 * s; // room for the metadata footer
     let mut y = py + 15.0 * s;
     let pal = palette();
     let ink = pal.ink;
-    let body_ink = pal.ink2;
+    let body_ink = pal.body;
+    let ts = type_scale(s);
 
     for block in blocks {
         if y >= bottom { break; }
         match block {
-            Block::Title(text) | Block::Heading(text) => {
-                let title = matches!(block, Block::Title(_));
-                let size = if title { 15.5 } else { 12.5 } * s;
-                let weight = if title { 700 } else { 600 };
-                let color = if title { ink } else { pal.ink };
+            Block::Title(text) => {
+                let size = ts.title;
                 // bold glyphs run wider than the estimate: leave it headroom so
                 // lines break instead of being clipped
                 for line in wrap_lines(text, size, iw * 0.93) {
                     if y + size * 1.3 > bottom { return; }
-                    draw_text(fb, &line, ix as i32, y as i32, iw as i32, size as i32, weight, color, 0);
-                    y += size * 1.45;
+                    draw_text(fb, &line, ix as i32, y as i32, iw as i32, size as i32, 700, ink, 0);
+                    y += size * 1.35;
                 }
-                y += size * 0.35;
+                y += 7.0 * s;
+            }
+            Block::Heading(level, text) => {
+                let (size, gap) = if *level >= 2 { (ts.h2, 4.0 * s) } else { (ts.h1, 5.0 * s) };
+                for line in wrap_lines(text, size, iw * 0.93) {
+                    if y + size * 1.3 > bottom { return; }
+                    draw_text(fb, &line, ix as i32, y as i32, iw as i32, size as i32, 600, ink, 0);
+                    y += size * 1.40;
+                }
+                y += gap;
             }
             Block::Para(text) | Block::Bullet(text) => {
-                let size = 10.5 * s;
+                let size = ts.body;
                 let bullet = matches!(block, Block::Bullet(_));
                 let tx = if bullet { ix + 11.0 * s } else { ix };
                 let tw = if bullet { iw - 11.0 * s } else { iw };
@@ -2816,54 +2850,166 @@ fn draw_doc_page(fb: &mut Framebuffer, blocks: &[Block], style: &TypeStyle, px: 
                 for line in wrap_lines(text, size, tw * 0.96) {
                     if y + size * 1.35 > bottom { return; }
                     if bullet && first {
-                        fb.round_rect(ix + 2.0 * s, y + size * 0.42, 4.0 * s, 4.0 * s, 2.0 * s, style.accent, 210);
+                        fb.round_rect(ix + 1.5 * s, y + size * 0.45, 4.5 * s, 4.5 * s, 2.25 * s, style.accent, 190);
                     }
                     draw_text(fb, &line, tx as i32, y as i32, tw as i32, size as i32, 400, body_ink, 0);
-                    y += size * 1.5;
+                    y += size * 1.55;
                     first = false;
                 }
-                y += size * 0.45;
+                y += 5.0 * s;
             }
             Block::Table(rows) => {
                 let cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).clamp(1, 6);
                 let cw = iw / cols as f32;
-                let rh = 19.0 * s;
+                let rh = 21.0 * s;
+                let cell_size = (ts.caption) as i32;
                 for (ri, row) in rows.iter().enumerate() {
                     if y + rh > bottom { return; }
                     if ri == 0 {
-                        let head = if palette().paper == (255, 255, 255) { style.accent } else { (255, 255, 255) };
-                        fb.round_rect(ix, y, iw, rh, 3.0 * s, head, 26);
+                        // a neutral band, not a tinted one: tables stay quiet
+                        fb.round_rect(ix, y, iw, rh, 3.0 * s, pal.rule, 90);
+                    } else if ri % 2 == 1 {
+                        fb.round_rect(ix, y, iw, rh, 3.0 * s, pal.rule, 40);
                     }
                     for c in 0..cols {
                         if let Some(cell) = row.get(c) {
                             if cell.is_empty() { continue; }
+                            // numbers hug the right edge of their column
+                            let right = is_numeric_cell(cell) && c > 0;
+                            let x = if right {
+                                (ix + (c + 1) as f32 * cw - 8.0 * s - measure_text(cell, cell_size, if ri == 0 { 600 } else { 400 })).max(ix + c as f32 * cw + 2.0 * s)
+                            } else {
+                                ix + c as f32 * cw + 8.0 * s
+                            };
                             draw_text(
                                 fb, cell,
-                                (ix + c as f32 * cw + 5.0 * s) as i32, (y + 4.0 * s) as i32,
-                                (cw - 9.0 * s) as i32, (9.5 * s) as i32,
-                                if ri == 0 { 600 } else { 400 }, body_ink, 0,
+                                x as i32, (y + 5.5 * s) as i32,
+                                (cw - 12.0 * s) as i32, cell_size,
+                                if ri == 0 { 600 } else { 400 },
+                                if ri == 0 { ink } else { body_ink }, 0,
                             );
                         }
                     }
                     y += rh;
-                    fb.round_rect(ix, y - 0.5, iw, 1.0, 0.5, palette().rule, 120);
+                    let sep = if ri == 0 { 160 } else { 120 };
+                    fb.round_rect(ix, y - 0.5, iw, 1.0, 0.5, palette().rule, sep);
                 }
             }
         }
     }
 }
 
+/// `186.5`, `12.5 %`, `-3`: cells that read as numbers get
+/// right-aligned so digits line up down the column.
+fn is_numeric_cell(s: &str) -> bool {
+    let cleaned: String = s.chars().filter(|c| *c != ',').collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() { return false; }
+    cleaned.parse::<f64>().is_ok()
+}
+
+// ── document metadata footer ─────────────────────────────────────────────────
+
+/// "12.3 KB"-style size; empty when the file is gone.
+fn doc_size_label(path: &str) -> String {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let b = m.len();
+            if b < 1024 { format!("{b} B") }
+            else if b < 1024 * 1024 { format!("{:.1} KB", b as f64 / 1024.0) }
+            else { format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)) }
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// mtime seconds since the epoch (0 when unavailable); feeds the cache key so
+/// a changed file re-renders its footer.
+fn doc_mtime_secs(path: &str) -> u64 {
+    std::fs::metadata(path).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// days-since-epoch → (year, month, day); Howard Hinnant's civil_from_days.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// local-UTC offset in seconds, from GetLocalTime vs GetSystemTime.
+fn tz_offset_secs() -> i64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| unsafe {
+        use winapi::um::sysinfoapi::{GetLocalTime, GetSystemTime};
+        use winapi::um::minwinbase::SYSTEMTIME;
+        let mut lt: SYSTEMTIME = std::mem::zeroed();
+        let mut ut: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut lt);
+        GetSystemTime(&mut ut);
+        let days_from_civil = |y: u16, m: u16, d: u16| -> i64 {
+            let y = y as i64 - i64::from(m <= 2);
+            let era = y.div_euclid(400);
+            let yoe = y - era * 400;
+            let mp = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
+            let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            era * 146097 + doe - 719468
+        };
+        let l = days_from_civil(lt.wYear, lt.wMonth, lt.wDay) * 86400
+            + lt.wHour as i64 * 3600 + lt.wMinute as i64 * 60 + lt.wSecond as i64;
+        let u = days_from_civil(ut.wYear, ut.wMonth, ut.wDay) * 86400
+            + ut.wHour as i64 * 3600 + ut.wMinute as i64 * 60 + ut.wSecond as i64;
+        l - u
+    })
+}
+
+/// Caption strip under a rendered document: `PDF · 1.2 MB · 2026-03-14`.
+fn draw_doc_footer(fb: &mut Framebuffer, card: &Card, px: f32, py: f32, pw: f32, ph: f32, s: f32) {
+    let pal = palette();
+    let ts = type_scale(s);
+    let ix = px + 15.0 * s;
+    let iw = pw - 30.0 * s;
+    let fy = py + ph - 22.0 * s;
+    fb.round_rect(ix, fy, iw, 1.0, 0.5, pal.rule, 90);
+    let size = doc_size_label(&card.path);
+    let mut label = card.file_ext();
+    if !size.is_empty() { label.push_str(&format!(" · {size}")); }
+    let date = doc_date_label(&card.path);
+    if !date.is_empty() { label.push_str(&format!(" · {date}")); }
+    draw_text(fb, &label, ix as i32, (fy + 6.0 * s) as i32, iw as i32, ts.caption as i32, 400, pal.ink2, 0);
+}
+
+fn doc_date_label(path: &str) -> String {
+    let secs = doc_mtime_secs(path) as i64 + tz_offset_secs();
+    if secs <= 0 { return String::new(); }
+    let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 fn draw_placeholder_page(fb: &mut Framebuffer, card: &Card, style: &TypeStyle, px: f32, py: f32, pw: f32, ph: f32, anim: f32, s: f32) {
     let fade = |v: f32| (v * anim).clamp(0.0, 255.0) as u8;
     let fs = |v: f32| ((v * s).round() as i32).max(7);
-    let ink = (44, 50, 62);
-    let body_ink = (72, 79, 92);
-    let bar = (0, 0, 0);
+    let pal = palette();
+    let ink = pal.ink;
+    let body_ink = pal.ink2;
+    let bar = pal.rule;
     let ix = px + 16.0 * s;
     let iw = pw - 32.0 * s;
     let stem = FsPath::new(&card.path).file_stem().unwrap_or_default().to_string_lossy().to_string();
     draw_text(fb, &stem, ix as i32, (py + 16.0 * s) as i32, iw as i32, fs(13.0), 700, ink, 0);
-    fb.round_rect(ix, py + 42.0 * s, iw, 1.0, 0.5, bar, fade(36.0));
+    fb.round_rect(ix, py + 42.0 * s, iw, 1.0, 0.5, bar, fade(110.0));
 
     let ext = card.file_ext();
     match ext.as_str() {
