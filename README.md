@@ -28,13 +28,15 @@ cargo build --release     # 精简发布版：LTO + strip + panic=abort，约 0.
 | 拖动卡片 / 页眉 | 移动（贴边、贴其他卡片会吸附并显示引导线；按住 Alt 关掉吸附） |
 | 拖四边 / 四角 | 独立调宽高，预览自动重排 |
 | 滚轮 | 等比缩放；在右侧滑动槽内滚轮 = 滚动整列 |
+| 悬停卡片按 `Space` | Quick Look 整页预览（滚轮 / `↑↓←→` / `PageUp`·`Down` 翻页，右上角显示页码；再按 Space / Esc 或点击任意处关闭） |
 | 双击页眉 / 右上箭头 | 折叠成标题胶囊 ↔ 展开 |
 | 右键卡片 | 打开 / 折叠 / 刷新缩略图 / 移除 |
-| 拖文件到卡片或 `+` 上 | 生成卡片（文件夹会展开前 8 个文件） |
+| 拖文件到卡片或 `+` 上 | 生成卡片，落点即卡片位置（文件夹会展开前 8 个文件；拖经过卡片或 `+` 后，整个桌面都是放置区） |
 | `Ctrl+Alt+D` | 剪贴板或资源管理器选中的文件 → 卡片（重复文件自动去重） |
 | `Ctrl+Alt+H` | 全部折叠 ↔ 全部展开（被别的程序占用时自动退到 `Ctrl+Alt+Shift+H`，托盘菜单里也有这一项） |
 | `Ctrl+Alt+T` | 整理成右侧一列（放不下时自动变成可滚动列） |
-| 齿轮菜单 | 刷新缩略图 / 重采样壁纸 / 置顶显示 / 全部折叠·展开 / 整理成列 / 配置目录 / 退出 |
+| 齿轮菜单 | 刷新全部缩略图 / 重新采样桌面背景 / 置顶显示 / 全部折叠·展开 / 整理成列 / 文件右键菜单开关 / 打开配置目录 / 退出 |
+| 托盘菜单 | 添加文件（文件对话框，支持多选）/ 预览光标下的卡片 / 置顶 / 全部折叠 / 退出 |
 
 ## 图标
 
@@ -55,10 +57,19 @@ better-desktop --help      # 快捷键速查
 | 类型 | 预览 |
 |---|---|
 | 图片 | 直接用原图，卡片自动按图片比例变横/竖 |
-| PDF | 有文字层时按正文排版渲染；没有文字层时用 `Windows.Data.Pdf` 栅格化首页 |
+| PDF | 有文字层时按正文排版渲染；没有文字层时由**短命子进程**调用 `Windows.Data.Pdf` 栅格化页面（预览可翻页） |
 | DOCX / XLSX / MD / TXT | 解析 OOXML / 文本，按标题、正文、表格排版成可读的纸张 |
 | PPTX | **渲染第一页**：读 `slide1.xml` 的背景色、文本框位置与字号、以及图片，按 16:9 画出来；解析失败才退回文字页 |
 | 其他 | 系统缩略图（`IShellItemImageFactory`），空白缩略图会被丢弃 |
+
+## 性能与内存
+
+- 脏区渲染：每帧只清理与拷贝卡片、工具栏实际覆盖的矩形，透明区域零开销
+- Framebuffer 直接借用 GDI DIB 内存渲染，省去一次全屏拷贝与 22.5 MB 常驻
+- PDF 栅格化在短命子进程里完成：`Windows.Data.Pdf`（Direct2D + DWrite）的
+  ~160 MB 私有内存随子进程退出而释放，不驻留在常驻进程里
+- 各类位图缓存都有上限（卡片 16 / PDF 页 6 / 文字位图 512），不会无界增长
+- 实测：单卡片常驻 ~33 MB（Private），交互 ~4 ms/帧；诊断用 `BD_MEM` 探针
 
 ## 一键生成卡片（最省事）
 
@@ -130,18 +141,19 @@ better-desktop --help      # 快捷键速查
 
 ## 结构
 
-单文件 `src/main.rs`（约 3.7k 行），按段落分块：
+单文件 `src/main.rs`（约 5.6k 行），按段落分块：
 
 | 段落 | 内容 |
 |---|---|
 | `Card` / `AppConfig` | 数据模型、几何（`box_w`/`box_h`/`visual_x`）、JSON 读写 |
-| `Framebuffer` | 光栅：`round_rect`、`glass_paper`（纸面 + 玻璃边）、`span_opaque` |
-| 文本 | `render_text_to_bitmap`（GDI + alpha 位图缓存）、`measure_text`、`wrap_lines` |
-| 内容提取 | docx/pptx/xlsx（zip + XML）、pdf（inflate 文字层 / WinRT 页面栅格）、md/txt/csv |
-| `paint_card` / `draw_card` | 卡片绘制与每卡缓存、`blit_card` 合成 |
+| `Framebuffer` | SDF 软件光栅：`round_rect`、`soft_rect`（柔和阴影）、`glass_paper`、`span_opaque` |
+| 文本 | `render_text_to_bitmap`（GDI + alpha 位图缓存）、`measure_text`、`wrap_lines`、`TypeScale` 排版令牌 |
+| 内容提取 | docx/pptx/xlsx（zip + XML）、pdf（inflate 文字层 / 子进程 WinRT 页面栅格）、md/txt/csv |
+| `paint_card` / `draw_card` | 卡片绘制与每卡缓存（`CardImage`）、`blit_card` 合成、元信息脚注 |
 | 桌面 | `work_areas`、`snap_position`、`place_free`、`clamp_card`、`tidy_column`、`pack_column` |
-| 窗口 | `install_layered_style`、`apply_zorder`、`Presenter::present`（`UpdateLayeredWindow`） |
-| 交互 | 事件循环：拖动、四边缩放、折叠、右键菜单、热键、托盘 |
+| 窗口 | `install_layered_style`、`apply_zorder`、`Presenter`（`UpdateLayeredWindow` 直绘 DIB） |
+| 脏区 | `card_dst_rect` + `prev/cur_dirty`：只清理与拷贝有内容的矩形 |
+| 交互 | 事件循环：拖动、四边缩放、折叠、吸附、右键菜单、热键、托盘、Space 预览 |
 
 ## 开发脚本
 
