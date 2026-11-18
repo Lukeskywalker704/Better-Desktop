@@ -281,11 +281,16 @@ impl AppConfig {
 
 // Pixels are stored PREMULTIPLIED BGRA (required by UpdateLayeredWindow;
 // alpha=0 regions are automatically click-through and skip DWM work).
-struct Framebuffer { width: u32, height: u32, pixels: Vec<u8> }
+/// The frame surface. `pixels` may be owned (scratch buffers) or borrowed
+/// from the Presenter's GDI DIB section — in the latter case rendering writes
+/// straight into the memory UpdateLayeredWindow reads, and the separate
+/// full-frame copy disappears. Stored PREMULTIPLIED BGRA.
+struct Framebuffer<'a> { width: u32, height: u32, pixels: &'a mut [u8] }
 
-impl Framebuffer {
-    fn new(w: u32, h: u32) -> Self {
-        Self { width: w, height: h, pixels: vec![0; (w * h * 4) as usize] }
+impl<'a> Framebuffer<'a> {
+    fn from_slice(pixels: &'a mut [u8], w: u32, h: u32) -> Self {
+        debug_assert_eq!(pixels.len(), (w * h * 4) as usize);
+        Self { width: w, height: h, pixels }
     }
     fn clear(&mut self) { self.pixels.fill(0); }
     /// Blend a straight-alpha color onto the premultiplied buffer.
@@ -864,9 +869,28 @@ fn pdf_page_count(path: &str) -> usize {
     }
 }
 
-/// Rasterise one page of a PDF through the Windows PDF engine: most machines
-/// ship no shell thumbnail provider for PDFs, but they do have Windows.Data.Pdf.
+/// Rasterise one page of a PDF through the Windows PDF engine. Runs in a
+/// short-lived CHILD process: Windows.Data.Pdf (Direct2D + DWrite + font
+/// caches) costs ~160 MB of private memory once loaded, and that memory dies
+/// with the child instead of living in the overlay forever.
 fn pdf_page_raster(path: &str, page: u32, target_w: u32) -> Option<Thumbnail> {
+    // prefer the helper child; fall back to in-process rendering if spawning
+    // somehow fails, so previewing never breaks
+    if let Ok(exe) = std::env::current_exe() {
+        let spec = format!("--render-pdf={path}|{page}|{target_w}");
+        if let Ok(out) = std::process::Command::new(exe).arg(spec).output() {
+            if out.status.success() && !out.stdout.is_empty() {
+                if let Some(t) = png_to_thumbnail(&out.stdout) {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    pdf_page_png(path, page, target_w).and_then(|png| png_to_thumbnail(&png))
+}
+
+/// The raw PNG bytes of one rasterised PDF page (in-process WinRT path).
+fn pdf_page_png(path: &str, page: u32, target_w: u32) -> Option<Vec<u8>> {
     use windows::core::HSTRING;
     use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
     use windows::Storage::StorageFile;
@@ -892,7 +916,7 @@ fn pdf_page_raster(path: &str, page: u32, target_w: u32) -> Option<Thumbnail> {
         reader.LoadAsync(size as u32).ok()?.get().ok()?;
         let mut png = vec![0u8; size];
         reader.ReadBytes(&mut png).ok()?;
-        png_to_thumbnail(&png)
+        Some(png)
     }
 }
 
@@ -1020,10 +1044,15 @@ fn generate_thumbnails(cards: &[Card], thumbs: &mut HashMap<String, Thumbnail>) 
         );
     }
     for card in cards {
-        if !thumbs.contains_key(&card.path) {
-            if let Some(t) = file_preview(&card.path, THUMB_PX) {
-                thumbs.insert(card.path.clone(), t);
-            }
+        if thumbs.contains_key(&card.path) { continue; }
+        // text documents are painted from parsed blocks; their 640-px shell
+        // thumbnails would sit in memory unused (several MB per card)
+        let ext = card.file_ext().to_lowercase();
+        let text_doc = matches!(ext.as_str(),
+            "docx" | "doc" | "xlsx" | "xls" | "md" | "markdown" | "txt" | "csv");
+        if text_doc { continue; }
+        if let Some(t) = file_preview(&card.path, THUMB_PX) {
+            thumbs.insert(card.path.clone(), t);
         }
     }
 }
@@ -1384,6 +1413,7 @@ fn pptx_picture_of(path: &str, kind: &str, stem: &str) -> Option<Thumbnail> {
 
 
 /// One paragraph of a slide, with the style of its first run.
+#[derive(Clone)]
 struct SlideLine {
     text: String,
     size_pt: f32,
@@ -1393,6 +1423,7 @@ struct SlideLine {
     bullet: bool,
 }
 
+#[derive(Clone)]
 struct SlideShape {
     x: f32,
     y: f32,
@@ -1404,6 +1435,7 @@ struct SlideShape {
 
 /// A first slide we can actually draw: EMU geometry, solid background, text
 /// boxes and pictures.
+#[derive(Clone)]
 struct Slide {
     w: f32,
     h: f32,
@@ -1452,7 +1484,34 @@ fn slide_line(para: &str) -> Option<SlideLine> {
 }
 
 /// Parse the first slide of a deck into something drawable.
+/// Cached slide models: a PPTX card repaints on hover/fold/zoom and the deck
+/// (zip + embedded 900-px images) is re-read only when the file changes.
+/// Without this, a fold animation re-parses the deck every 16 ms tick.
 fn slide_model(path: &str, n: u32) -> Option<Slide> {
+    type SlideCache = HashMap<String, (u64, u64, u32, Option<Slide>)>;
+    static CACHE: Mutex<Option<SlideCache>> = Mutex::new(None);
+    let stamp = fs::metadata(path).ok()
+        .map(|m| {
+            let t = m.modified().ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()).unwrap_or(0);
+            (m.len(), t)
+        })
+        .unwrap_or((0, 0));
+    let key = format!("{path}|{n}");
+    let mut guard = CACHE.lock().unwrap();
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some((len, t, pn, model)) = cache.get(&key) {
+        if (*len, *t, *pn) == (stamp.0, stamp.1, n) { return model.clone(); }
+    }
+    let model = parse_slide_model(path, n);
+    // a slide model can carry a 900-px image; keep only a few around
+    if cache.len() > 4 { cache.clear(); }
+    cache.insert(key, (stamp.0, stamp.1, n, model.clone()));
+    model
+}
+
+fn parse_slide_model(path: &str, n: u32) -> Option<Slide> {
     let size = zip_entry(path, &["ppt/presentation.xml"])?;
     let size = String::from_utf8_lossy(&size).to_string();
     let (sw, sh) = size
@@ -1949,9 +2008,7 @@ fn pdf_page_image(path: &str, page: usize) -> Option<Thumbnail> {
     let page = pdf_page_raster(path, page as u32, 1100);
     if let Ok(mut guard) = CACHE.lock() {
         let cache = guard.get_or_insert_with(HashMap::new);
-        if cache.len() > 16 {
-            cache.clear();
-        }
+    if cache.len() > 6 { cache.clear(); }
         cache.insert(key, page.clone());
     }
     page
@@ -2028,6 +2085,9 @@ fn draw_text(fb: &mut Framebuffer, text: &str, x: i32, y: i32, max_w: i32, size:
     let key = (text.to_string(), max_w, size, weight, align);
     let mut guard = TEXT_CACHE.lock().unwrap();
     let cache = guard.get_or_insert_with(HashMap::new);
+    // zooming mints a new bitmap per size; without a cap the cache grows
+    // without bound during wheel resizing
+    if cache.len() > 512 { cache.clear(); }
     let tb = cache.entry(key)
         .or_insert_with(|| render_text_to_bitmap(text, max_w, size, weight, align));
     for row in 0..tb.h as i32 {
@@ -2144,13 +2204,68 @@ struct CardImage { w: i32, h: i32, px: Vec<u8>, body: (i32, i32, i32, i32) }
 
 type CardCache = HashMap<String, CardImage>;
 
-fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hover_idx: Option<usize>, lifted_idx: Option<usize>, thumbs: &HashMap<String, Thumbnail>, anims: &[(usize, std::time::Instant)], folds: &HashMap<String, FoldAnim>, toolbar: Toolbar, drag_active: bool, guides: &[Guide], edge_hint: Option<(usize, u8)>) {
-    fb.clear();
+/// a region of the frame whose content changed this frame: (x, y, w, h)
+type DirtyRect = (i32, i32, i32, i32);
+
+/// Destination rect of a card's bitmap (or direct paint) on the frame:
+/// (x, y, w, h) including the cache padding that carries the shadow.
+/// Keep the geometry in sync with `draw_card` — the dirty-region renderer
+/// clears and copies exactly these rects.
+fn card_dst_rect(card: &Card, open: f32, anim: f32, lifted: bool) -> (i32, i32, i32, i32) {
+    let w = card.box_w();
+    let s = (w / CARD_BASE_W).clamp(0.45, 2.4);
+    let h_folded = COLLAPSED_H * card.scale();
+    let h_full = card.height.max(h_folded);
+    let h = (h_folded + (h_full - h_folded) * open.clamp(0.0, 1.0)).round();
+    let lift = if lifted { 8.0 * s } else { 0.0 };
+    let slide = (1.0 - anim.clamp(0.0, 1.0)) * 8.0 * s;
+    let dx = card.visual_x();
+    let dy = card.y - lift - slide;
+    let pad = (30.0 * s).ceil() as i32;
+    let bw = w as i32 + pad * 2;
+    let bh = h as i32 + pad * 2;
+    (dx as i32 - pad, dy as i32 - pad, bw, bh)
+}
+
+/// Zero a clipped rect of the framebuffer (row-wise, no full-frame memset).
+fn clear_region(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32) {
+    let x = x.max(0);
+    let y = y.max(0);
+    let w = w.min(fb.width as i32 - x).max(0);
+    let h = h.min(fb.height as i32 - y).max(0);
+    if w == 0 || h == 0 { return; }
+    let stride = fb.width as usize * 4;
+    for row in y..y + h {
+        let base = row as usize * stride + x as usize * 4;
+        fb.pixels[base..base + w as usize * 4].fill(0);
+    }
+}
+
+fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hover_idx: Option<usize>, lifted_idx: Option<usize>, thumbs: &HashMap<String, Thumbnail>, anims: &[(usize, std::time::Instant)], folds: &HashMap<String, FoldAnim>, toolbar: Toolbar, drag_active: bool, guides: &[Guide], edge_hint: Option<(usize, u8)>, prev_dirty: &[DirtyRect], cur_dirty: &mut Vec<DirtyRect>) {
+    let fw = fb.width as i32;
+    let fh = fb.height as i32;
+    // dirty-region bookkeeping: everything drawn this frame is confined to the
+    // rects below (card bitmaps, toolbar, guides); regions outside them were
+    // transparent last frame and stay transparent, so they need neither a
+    // clear nor a copy.
+    let mut rects: Vec<DirtyRect> = Vec::with_capacity(prev_dirty.len() + cur_dirty.len() + 8);
+    rects.extend_from_slice(prev_dirty);
+    rects.extend_from_slice(cur_dirty);
+    let fullscreen = drag_active
+        || rects.iter().any(|&(x, y, w, h)| x <= 0 && y <= 0 && w >= fw && h >= fh);
+    if fullscreen {
+        fb.clear();
+    } else {
+        for &(x, y, w, h) in &rects {
+            clear_region(fb, x, y, w, h);
+        }
+    }
     if drag_active {
         // alpha>=1 makes the whole window hit-testable, turning the entire
         // desktop into a drop zone while a file drag is in progress
-        fb.fill_rect(0, 0, fb.width as i32, fb.height as i32, 255, 255, 255, 7);
-        draw_text(fb, "松开即可生成卡片（拖到任意卡片或 + 上）", (fb.width as i32 - 600) / 2, (fb.height as i32 - 110) / 2, 600, (26.0 * ui_scale()) as i32, 600, (58, 66, 88), 1);
+        fb.fill_rect(0, 0, fw, fh, 255, 255, 255, 7);
+        draw_text(fb, "松开即可生成卡片（拖到任意卡片或 + 上）", (fw - 600) / 2, (fh - 110) / 2, 600, (26.0 * ui_scale()) as i32, 600, (58, 66, 88), 1);
+        cur_dirty.push((0, 0, fw, fh));
     }
     let guard = BACKDROP.lock().unwrap();
     let backdrop = guard.as_ref();
@@ -2158,24 +2273,40 @@ fn render_cards(fb: &mut Framebuffer, cache: &mut CardCache, cards: &[Card], hov
     for (i, card) in cards.iter().enumerate() {
         if lifted_idx == Some(i) { continue; }
         let anim = anim_progress(anims, i, now);
+        if anim <= 0.02 { continue; }
         let open = open_of(folds, &card.path, card.collapsed, now);
         draw_card(fb, cache, card, hover_idx == Some(i), false, anim, thumbs.get(&card.path), backdrop, open, 0);
+        cur_dirty.push(card_dst_rect(card, open, anim, false));
     }
     // lifted card renders last so it floats above the others
     if let Some(i) = lifted_idx {
         if let Some(card) = cards.get(i) {
             let open = open_of(folds, &card.path, card.collapsed, now);
-            draw_card(fb, cache, card, hover_idx == Some(i), true, anim_progress(anims, i, now), thumbs.get(&card.path), backdrop, open, 0);
+            let anim = anim_progress(anims, i, now);
+            if anim > 0.02 {
+                draw_card(fb, cache, card, hover_idx == Some(i), true, anim, thumbs.get(&card.path), backdrop, open, 0);
+                cur_dirty.push(card_dst_rect(card, open, anim, true));
+            }
         }
     }
     drop(guard);
     draw_guides(fb, guides);
+    for g in guides {
+        if g.vertical {
+            cur_dirty.push((g.pos as i32 - 3, g.from as i32 - 3, 6, (g.to - g.from) as i32 + 6));
+        } else {
+            cur_dirty.push((g.from as i32 - 3, g.pos as i32 - 3, (g.to - g.from) as i32 + 6, 6));
+        }
+    }
     if let Some((i, e)) = edge_hint {
         if let Some(card) = cards.get(i) {
             draw_resize_hint(fb, card, e, ui_scale());
         }
     }
     draw_toolbar(fb, toolbar);
+    let (tx, ty, tw, th) = toolbar.rect;
+    let k = ui_scale();
+    cur_dirty.push(((tx - 20.0 * k) as i32, (ty - 20.0 * k) as i32, (tw + 40.0 * k) as i32, (th + 40.0 * k) as i32));
 }
 
 /// Blend a premultiplied card bitmap onto the framebuffer at (x, y). Inside the
@@ -2273,17 +2404,19 @@ fn draw_card(fb: &mut Framebuffer, cache: &mut CardCache, card: &Card, hovered: 
     }
     let bw = w as i32 + pad * 2;
     let bh = h as i32 + pad * 2;
-    let mut scratch = Framebuffer::new(bw.max(1) as u32, bh.max(1) as u32);
+    let mut scratch_px = vec![0u8; (bw.max(1) * bh.max(1) * 4) as usize];
+    let mut scratch = Framebuffer::from_slice(&mut scratch_px, bw.max(1) as u32, bh.max(1) as u32);
     paint_card(&mut scratch, card, pad as f32, pad as f32, hovered, lifted, 1.0, thumb, backdrop, open, page);
     let img = CardImage {
-        w: bw, h: bh, px: std::mem::take(&mut scratch.pixels),
+        w: bw, h: bh, px: scratch_px,
         // the paper no longer has a translucent band, so nothing needs to be
         // composited against the frosted backdrop: plain alpha over the screen
         body: (0, 0, 0, 0),
     };
     blit_card(fb, &img, dx as i32 - pad, dy as i32 - pad, backdrop);
-    if cache.len() > 48 { cache.clear(); }
-    cache.insert(key, img);
+    // each cached bitmap is 1-5 MB (grows with the card's zoom); a small ring
+    // keeps the resident set bounded while still covering hover/zoom states
+    if cache.len() > 16 { cache.clear(); }    cache.insert(key, img);
 }
 
 /// Damped spring, solved analytically: 0 at `t = 0`, 1 at `t = inf`. With
@@ -4288,20 +4421,32 @@ impl Presenter {
         }
     }
 
-    fn present(&mut self, hwnd: HWND, pos: (i32, i32), fb: &Framebuffer) {
-        if fb.width == 0 || fb.height == 0 { return; }
-        if std::env::var("BD_DUMP").is_ok() {
-            // dump mode renders exactly one frame and leaves: it must never keep
-            // running as a second overlay
-            dump_bmp(config_dir().join("frame.bmp"), fb);
-            std::process::exit(0);
-        }
-        self.resize(fb.width, fb.height);
+    fn size_bytes(&self) -> usize {
+        (self.w as usize) * (self.h as usize) * 4
+    }
+
+    /// The frame surface, borrowed straight from the DIB section: rendering
+    /// writes into the exact memory UpdateLayeredWindow reads.
+    fn fb_view(&mut self) -> Framebuffer<'_> {
         unsafe {
-            std::ptr::copy_nonoverlapping(fb.pixels.as_ptr(), self.bits, fb.pixels.len());
+            Framebuffer::from_slice(
+                std::slice::from_raw_parts_mut(self.bits, self.size_bytes()),
+                self.w, self.h,
+            )
+        }
+    }
+
+    /// Composite is already in the DIB (rendering writes straight into it);
+    /// hand it to DWM. `dirty` is unused here — ULW always submits the whole
+    /// surface — but kept for symmetry with the render bookkeeping.
+    fn present(&mut self, hwnd: HWND, pos: (i32, i32)) {
+        if self.w == 0 || self.h == 0 { return; }
+        let hdc = self.hdc;
+        let (w, h) = (self.w, self.h);
+        unsafe {
             let mut dst = POINT { x: pos.0, y: pos.1 };
             let mut src = POINT { x: 0, y: 0 };
-            let mut size = SIZE { cx: fb.width as i32, cy: fb.height as i32 };
+            let mut size = SIZE { cx: w as i32, cy: h as i32 };
             let mut blend = BLENDFUNCTION {
                 BlendOp: 1, // AC_SRC_OVER
                 BlendFlags: 0,
@@ -4313,7 +4458,7 @@ impl Presenter {
                 std::ptr::null_mut(),
                 &mut dst,
                 &mut size,
-                self.hdc,
+                hdc,
                 &mut src,
                 0,
                 &mut blend,
@@ -4481,6 +4626,24 @@ fn forward_to_running(paths: &[String]) -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // helper child: rasterise one PDF page to stdout and exit, so the Windows
+    // PDF engine's ~160 MB of private memory never settles in the overlay
+    for a in &args {
+        if let Some(spec) = a.strip_prefix("--render-pdf=") {
+            let parts: Vec<&str> = spec.split('|').collect();
+            if parts.len() == 3 {
+                if let (Ok(page), Ok(width)) = (parts[1].parse::<u32>(), parts[2].parse::<u32>()) {
+                    if let Some(png) = pdf_page_png(parts[0], page, width) {
+                        use std::io::Write;
+                        let mut so = std::io::stdout();
+                        let _ = so.write_all(&png);
+                        let _ = so.flush();
+                    }
+                }
+            }
+            return;
+        }
+    }
     // every command-line mode answers before the single-instance guard, so the
     // utility switches work while the overlay is already running
     if args.iter().any(|a| a == "--install-menu") {
@@ -4538,6 +4701,8 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     // one overlay per desktop: two instances would fight over the config file
     if std::env::var("BD_PROBE").is_err() && std::env::var("BD_BENCH").is_err() && std::env::var("BD_SNAP").is_err()
         && std::env::var("BD_BACKDROP").is_err() && std::env::var("BD_DPI").is_err()
+        && std::env::var("BD_DUMP").is_err() && std::env::var("BD_MEM").is_err()
+        && std::env::var("BD_PREVIEW").is_err()
     {
         unsafe {
             let name = wide("BetterDesktop.SingleInstance.v1");
@@ -4645,7 +4810,6 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     }
 
     let (w, h) = (vw as u32, vh as u32);
-    let mut fb = Framebuffer::new(w, h);
     let mut presenter = Presenter::new(w, h);
     // snapshot the desktop once for the glass to refract (our layered window is
     // excluded from the grab, so this is what sits behind the overlay)
@@ -4719,12 +4883,14 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
         let toolbar = toolbar_at(w as f32 * 0.5, h as f32 - 118.0, 1.0, false, false);
         let folds_empty: HashMap<String, FoldAnim> = HashMap::new();
         let mut bench_cache: CardCache = CardCache::new();
+        let mut bench_px = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut bench_fb = Framebuffer::from_slice(&mut bench_px, w, h);
         let t_cold = std::time::Instant::now();
-        render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], &folds_empty, toolbar, false, &[], None);
+        render_cards(&mut bench_fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], &folds_empty, toolbar, false, &[], None, &[], &mut Vec::new());
         let cold = t_cold.elapsed().as_secs_f64() * 1000.0;
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            render_cards(&mut fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], &folds_empty, toolbar, false, &[], None);
+            render_cards(&mut bench_fb, &mut bench_cache, &config.cards, None, None, &bench_thumbs, &[], &folds_empty, toolbar, false, &[], None, &[], &mut Vec::new());
         }
         eprintln!(
             "bench: {:.2} ms/frame, cold first frame {:.1} ms, {} cards",
@@ -4790,6 +4956,9 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     let mut card_cache: CardCache = CardCache::new();
     // alignment guides for the card being dragged / resized
     let mut guides: Vec<Guide> = Vec::new();
+    // dirty-region bookkeeping across frames (see render_cards / Presenter)
+    let mut prev_dirty: Vec<DirtyRect> = Vec::new();
+    let mut cur_dirty: Vec<DirtyRect> = Vec::new();
 
     event_loop.run(move |event, elwt| {
         match event {
@@ -4807,24 +4976,66 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
             }
             Event::WindowEvent { event: we, .. } => match we {
                 WindowEvent::RedrawRequested => {
-                    let lifted = if is_dragging { press_idx } else { None };
-                    render_cards(
-                        &mut fb, &mut card_cache, &config.cards, hover_idx, lifted, &thumbs, &anims,
-                        &fold_anims, toolbar_at(fab_x, fab_y, k, add_btn_hover, gear_btn_hover),
-                        drag_active, &guides, edge_hint,
-                    );
-                    if config.rail {
-                        draw_rail(&mut fb, &config.cards, &areas, ui_scale());
-                    }
-                    if let Some((idx, at, page)) = preview {
-                        if let Some(card) = config.cards.get(idx) {
-                            draw_preview(
-                                &mut fb, card, &thumbs, &mut card_cache, &areas,
-                                at.elapsed().as_secs_f32(), page,
-                            );
+                    let hwnd = get_hwnd(&window);
+                    let dib_bytes = presenter.size_bytes();
+                    // render straight into the DIB the compositor reads
+                    {
+                        let mut fb = presenter.fb_view();
+                        let lifted = if is_dragging { press_idx } else { None };
+                        cur_dirty.clear();
+                        if preview.is_some() || drag_active {
+                            cur_dirty.push((0, 0, fb.width as i32, fb.height as i32));
+                        }
+                        render_cards(
+                            &mut fb, &mut card_cache, &config.cards, hover_idx, lifted, &thumbs, &anims,
+                            &fold_anims, toolbar_at(fab_x, fab_y, k, add_btn_hover, gear_btn_hover),
+                            drag_active, &guides, edge_hint, &prev_dirty, &mut cur_dirty,
+                        );
+                        if config.rail {
+                            draw_rail(&mut fb, &config.cards, &areas, ui_scale());
+                            if let Some((x, ty, th, _, _)) = rail_thumb(&config.cards, &areas, ui_scale()) {
+                                let u = ui_scale();
+                                cur_dirty.push(((x - 2.0 * u) as i32, (ty - 4.0 * u) as i32,
+                                                (8.0 * u) as i32, (th + 8.0 * u) as i32));
+                            }
+                        }
+                        if let Some((idx, at, page)) = preview {
+                            if let Some(card) = config.cards.get(idx) {
+                                draw_preview(
+                                    &mut fb, card, &thumbs, &mut card_cache, &areas,
+                                    at.elapsed().as_secs_f32(), page,
+                                );
+                            }
+                        }
+                        // dump mode renders exactly one frame and leaves
+                        if std::env::var("BD_DUMP").is_ok() {
+                            dump_bmp(config_dir().join("frame.bmp"), &fb);
+                            std::process::exit(0);
                         }
                     }
-                    presenter.present(get_hwnd(&window), (vx, vy), &fb);
+                    presenter.present(hwnd, (vx, vy));
+                    prev_dirty.clear();
+                    prev_dirty.extend_from_slice(&cur_dirty);
+                    // memory probe: print the big allocations once, then leave
+                    if std::env::var("BD_MEM").is_ok() {
+                        let mb = |b: usize| format!("{:.1} MB", b as f64 / (1024.0 * 1024.0));
+                        let cc: usize = card_cache.values().map(|i| i.px.len()).sum();
+                        let th: usize = thumbs.values().map(|t| t.data.len()).sum();
+                        let tc: usize = TEXT_CACHE.lock().unwrap().as_ref()
+                            .map(|c| c.values().map(|b| b.alpha.len()).sum()).unwrap_or(0);
+                        let bd = BACKDROP.lock().unwrap().as_ref()
+                            .map(|b| b.px.len()).unwrap_or(0);
+                        eprintln!(
+                            "mem: dib={dib_bytes} cards({n0})={mb0} thumbs({n1})={mb1} text({n2})={mb2} backdrop={mb3} | \
+                             compare with process numbers",
+                            n0 = card_cache.len(), mb0 = mb(cc), n1 = thumbs.len(), mb1 = mb(th),
+                            n2 = TEXT_CACHE.lock().unwrap().as_ref().map(|c| c.len()).unwrap_or(0), mb2 = mb(tc), mb3 = mb(bd),
+                            dib_bytes = mb(dib_bytes),
+                        );
+                        // stay alive briefly so the process totals can be sampled
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        elwt.exit();
+                    }
                 }
                 WindowEvent::ModifiersChanged(mods) => {
                     alt_down = mods.state().alt_key();
@@ -5279,7 +5490,9 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
                 WindowEvent::Resized(ns) => {
                     let nw = ns.width.max(1);
                     let nh = ns.height.max(1);
-                    fb = Framebuffer::new(nw, nh);
+                    presenter.resize(nw, nh);
+                    prev_dirty.clear();
+                    cur_dirty.clear();
                     if nw != vw as u32 || nh != vh as u32 {
                         unsafe {
                             SetWindowPos(get_hwnd(&window), std::ptr::null_mut(),
