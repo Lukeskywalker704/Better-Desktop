@@ -14,7 +14,7 @@ use winapi::{
     shared::minwindef::HKEY,
     shared::windef::{HBITMAP, HDC, HGDIOBJ, HICON, HMONITOR, HWND, POINT, RECT, SIZE},
     um::{
-        errhandlingapi::GetLastError,
+        errhandlingapi::{GetLastError, SetLastError},
         libloaderapi::GetModuleHandleW,
         synchapi::CreateMutexW,
         shellapi::{DragQueryFileW, Shell_NotifyIconW, HDROP, NOTIFYICONDATAW, NIM_ADD, NIM_DELETE},
@@ -4706,6 +4706,11 @@ Ctrl+Alt+T  整理成右侧一列\n\n\
     {
         unsafe {
             let name = wide("BetterDesktop.SingleInstance.v1");
+            // CreateMutexW only reports ERROR_ALREADY_EXISTS through GetLastError
+            // when the name exists — on a fresh create the kernel may leave a
+            // stale value from an earlier call, which used to make a brand-new
+            // instance exit silently. Reset it so the check is meaningful.
+            SetLastError(0);
             let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
             if !handle.is_null() && GetLastError() == 183 {
                 // ERROR_ALREADY_EXISTS: another overlay already owns the desktop
